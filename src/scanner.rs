@@ -223,12 +223,16 @@ fn load_index(root: &Path) -> io::Result<Option<PersistedIndex>> {
         return Ok(None);
     };
 
-    if files_index.version != INDEX_VERSION
-        || tags_index.version != INDEX_VERSION
-        || files_index.root != root.display().to_string()
-        || tags_index.root != root.display().to_string()
-        || files_index.files.len() != tags_index.file_tags.len()
-    {
+    if files_index.version != INDEX_VERSION || tags_index.version != INDEX_VERSION {
+        return Ok(None);
+    }
+
+    let root_string = root.display().to_string();
+    if files_index.root != root_string || tags_index.root != root_string {
+        return Ok(None);
+    }
+
+    if files_index.files.len() != tags_index.file_tags.len() {
         return Ok(None);
     }
 
