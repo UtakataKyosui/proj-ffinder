@@ -1,32 +1,176 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
+use bincode::config::standard;
+use bincode::serde::{decode_from_slice, encode_to_vec};
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 
 use crate::model::{ContentMetrics, ContentSummary, FileSummary, LocationSummary, ScanResult, Tag};
 use crate::polyglot_ast::analyze_other_file;
 use crate::rust_ast::analyze_rust_file;
 
-pub fn scan_project(root: &Path) -> io::Result<ScanResult> {
+const INDEX_DIR: &str = ".proj-finder";
+const FILES_INDEX_FILE: &str = "files.bin";
+const TAGS_INDEX_FILE: &str = "tags.bin";
+const LEGACY_COMBINED_INDEX_FILE: &str = "index.bin";
+const LEGACY_JSON_INDEX_FILE: &str = "index.json";
+const INDEX_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ScanMode {
+    Full,
+    Incremental,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistedFilesIndex {
+    version: u32,
+    root: String,
+    files: Vec<PersistedFileSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CachedFileSummary {
+    path: String,
+    hash: String,
+    summary: FileSummary,
+}
+
+#[derive(Debug)]
+struct PersistedIndex {
+    version: u32,
+    root: String,
+    files: Vec<CachedFileSummary>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistedTagsIndex {
+    version: u32,
+    root: String,
+    strings: Vec<String>,
+    file_tags: Vec<Vec<CompactTag>>,
+    inverted_index: Vec<CompactPosting>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PersistedFileSummary {
+    path: String,
+    hash: String,
+    language: Option<String>,
+    kind: String,
+    location_summary: LocationSummary,
+    content_summary: Option<ContentSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CompactTag {
+    value_id: u32,
+    source_id: u32,
+    confidence: f32,
+    evidence_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CompactPosting {
+    value_id: u32,
+    file_indices: Vec<u32>,
+}
+
+#[derive(Debug, Default)]
+struct StringTableBuilder {
+    strings: Vec<String>,
+    ids: HashMap<String, u32>,
+}
+
+pub fn scan_project_with_mode(root: &Path, mode: ScanMode) -> io::Result<ScanResult> {
     let root = root.canonicalize()?;
-    let mut file_paths = collect_scannable_files(&root)?;
+    match mode {
+        ScanMode::Full => full_scan(&root),
+        ScanMode::Incremental => incremental_scan(&root),
+    }
+}
+
+fn full_scan(root: &Path) -> io::Result<ScanResult> {
+    let mut file_paths = collect_scannable_files(root)?;
     file_paths.sort();
 
-    let files = file_paths
+    let cached_files = file_paths
         .into_iter()
-        .map(|path| {
-            let relative = path
-                .strip_prefix(&root)
-                .expect("scanned file should stay under root");
-            summarize_file(&path, relative)
-        })
-        .collect();
+        .map(|path| cached_summary_for_path(root, &path))
+        .collect::<io::Result<Vec<_>>>()?;
+    persist_index(root, &cached_files)?;
 
     Ok(ScanResult {
         root: root.display().to_string(),
-        files,
+        files: cached_files
+            .into_iter()
+            .map(|cached| cached.summary)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn incremental_scan(root: &Path) -> io::Result<ScanResult> {
+    let Some(index) = load_index(root)? else {
+        return full_scan(root);
+    };
+    if index.version != INDEX_VERSION || index.root != root.display().to_string() {
+        return full_scan(root);
+    }
+
+    let mut current_paths = collect_scannable_files(root)?;
+    current_paths.sort();
+    let current_map = current_paths
+        .into_iter()
+        .map(|absolute_path| {
+            let relative = absolute_path
+                .strip_prefix(root)
+                .expect("scanned file should stay under root");
+            (normalize_path(relative), absolute_path)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let cached_map = index
+        .files
+        .into_iter()
+        .map(|cached| (cached.path.clone(), cached))
+        .collect::<HashMap<_, _>>();
+
+    let changed_paths = match collect_git_changed_paths(root) {
+        Ok(changed) if !contains_gitignore_change(&changed) => changed,
+        _ => collect_changed_paths_by_hash(&current_map, &cached_map)?,
+    };
+
+    let mut ordered_paths = current_map.keys().cloned().collect::<Vec<_>>();
+    ordered_paths.sort();
+
+    let mut cached_files = Vec::new();
+    for path in ordered_paths {
+        if !changed_paths.contains(&path)
+            && let Some(cached) = cached_map.get(&path)
+        {
+            cached_files.push(cached.clone());
+            continue;
+        }
+
+        let absolute_path = current_map
+            .get(&path)
+            .expect("ordered path should resolve to a current file");
+        cached_files.push(cached_summary_for_path(root, absolute_path)?);
+    }
+
+    persist_index(root, &cached_files)?;
+
+    Ok(ScanResult {
+        root: root.display().to_string(),
+        files: cached_files
+            .into_iter()
+            .map(|cached| cached.summary)
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -41,7 +185,7 @@ fn collect_scannable_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in builder.build() {
         let entry = entry.map_err(io::Error::other)?;
-        if path_contains_component(entry.path(), ".git") {
+        if path_contains_any_component(entry.path(), &[".git", INDEX_DIR]) {
             continue;
         }
         let Some(file_type) = entry.file_type() else {
@@ -54,6 +198,298 @@ fn collect_scannable_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     }
 
     Ok(files)
+}
+
+fn cached_summary_for_path(root: &Path, absolute_path: &Path) -> io::Result<CachedFileSummary> {
+    let relative = absolute_path
+        .strip_prefix(root)
+        .expect("scanned file should stay under root");
+    let path = normalize_path(relative);
+    let summary = summarize_file(absolute_path, relative);
+    let hash = compute_file_hash(absolute_path)?;
+
+    Ok(CachedFileSummary {
+        path,
+        hash,
+        summary,
+    })
+}
+
+fn load_index(root: &Path) -> io::Result<Option<PersistedIndex>> {
+    let Some(files_index) = load_files_index(root)? else {
+        return Ok(None);
+    };
+    let Some(tags_index) = load_tags_index(root)? else {
+        return Ok(None);
+    };
+
+    if files_index.version != INDEX_VERSION || tags_index.version != INDEX_VERSION {
+        return Ok(None);
+    }
+
+    let root_string = root.display().to_string();
+    if files_index.root != root_string || tags_index.root != root_string {
+        return Ok(None);
+    }
+
+    if files_index.files.len() != tags_index.file_tags.len() {
+        return Ok(None);
+    }
+
+    let mut files = Vec::with_capacity(files_index.files.len());
+    for (file, tags) in files_index.files.into_iter().zip(tags_index.file_tags) {
+        let Some(decoded_tags) = decode_tags(&tags, &tags_index.strings) else {
+            return Ok(None);
+        };
+        files.push(CachedFileSummary {
+            path: file.path.clone(),
+            hash: file.hash,
+            summary: FileSummary {
+                file_id: file.path.clone(),
+                path: file.path,
+                language: file.language,
+                kind: file.kind,
+                location_summary: file.location_summary,
+                content_summary: file.content_summary,
+                tags: decoded_tags,
+            },
+        });
+    }
+
+    Ok(Some(PersistedIndex {
+        version: INDEX_VERSION,
+        root: root.display().to_string(),
+        files,
+    }))
+}
+
+fn persist_index(root: &Path, files: &[CachedFileSummary]) -> io::Result<()> {
+    let index_dir = root.join(INDEX_DIR);
+    fs::create_dir_all(&index_dir)?;
+
+    let files_payload = PersistedFilesIndex {
+        version: INDEX_VERSION,
+        root: root.display().to_string(),
+        files: files
+            .iter()
+            .map(|file| PersistedFileSummary {
+                path: file.path.clone(),
+                hash: file.hash.clone(),
+                language: file.summary.language.clone(),
+                kind: file.summary.kind.clone(),
+                location_summary: file.summary.location_summary.clone(),
+                content_summary: file.summary.content_summary.clone(),
+            })
+            .collect(),
+    };
+    let tags_payload = build_tags_index(root, files);
+
+    let files_bytes = encode_to_vec(&files_payload, standard())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let tags_bytes = encode_to_vec(&tags_payload, standard())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(files_index_path(root), files_bytes)?;
+    fs::write(tags_index_path(root), tags_bytes)?;
+
+    for legacy_file in [LEGACY_COMBINED_INDEX_FILE, LEGACY_JSON_INDEX_FILE] {
+        let legacy_path = root.join(INDEX_DIR).join(legacy_file);
+        if legacy_path.exists() {
+            fs::remove_file(legacy_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn load_files_index(root: &Path) -> io::Result<Option<PersistedFilesIndex>> {
+    let path = files_index_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&path)?;
+    match decode_from_slice::<PersistedFilesIndex, _>(&bytes, standard()) {
+        Ok((index, _)) => Ok(Some(index)),
+        Err(error) => {
+            eprintln!(
+                "warn: failed to decode files index at {}, falling back to full scan: {error}",
+                path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn load_tags_index(root: &Path) -> io::Result<Option<PersistedTagsIndex>> {
+    let path = tags_index_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&path)?;
+    match decode_from_slice::<PersistedTagsIndex, _>(&bytes, standard()) {
+        Ok((index, _)) => Ok(Some(index)),
+        Err(error) => {
+            eprintln!(
+                "warn: failed to decode tags index at {}, falling back to full scan: {error}",
+                path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn build_tags_index(root: &Path, files: &[CachedFileSummary]) -> PersistedTagsIndex {
+    let mut strings = StringTableBuilder::default();
+    let mut file_tags = Vec::with_capacity(files.len());
+    let mut postings = HashMap::<u32, Vec<u32>>::new();
+
+    for (file_index, file) in files.iter().enumerate() {
+        let mut compact_tags = Vec::with_capacity(file.summary.tags.len());
+        for tag in &file.summary.tags {
+            let value_id = strings.intern(&tag.value);
+            let source_id = strings.intern(&tag.source);
+            let evidence_ids = tag
+                .evidence
+                .iter()
+                .map(|evidence| strings.intern(evidence))
+                .collect::<Vec<_>>();
+
+            compact_tags.push(CompactTag {
+                value_id,
+                source_id,
+                confidence: tag.confidence,
+                evidence_ids,
+            });
+            postings
+                .entry(value_id)
+                .or_default()
+                .push(file_index as u32);
+        }
+        file_tags.push(compact_tags);
+    }
+
+    let mut inverted_index = postings
+        .into_iter()
+        .map(|(value_id, file_indices)| CompactPosting {
+            value_id,
+            file_indices,
+        })
+        .collect::<Vec<_>>();
+    inverted_index.sort_by_key(|posting| posting.value_id);
+
+    PersistedTagsIndex {
+        version: INDEX_VERSION,
+        root: root.display().to_string(),
+        strings: strings.strings,
+        file_tags,
+        inverted_index,
+    }
+}
+
+fn decode_tags(tags: &[CompactTag], strings: &[String]) -> Option<Vec<Tag>> {
+    tags.iter()
+        .map(|tag| {
+            Some(Tag {
+                value: strings.get(tag.value_id as usize)?.clone(),
+                source: strings.get(tag.source_id as usize)?.clone(),
+                confidence: tag.confidence,
+                evidence: tag
+                    .evidence_ids
+                    .iter()
+                    .map(|id| strings.get(*id as usize).cloned())
+                    .collect::<Option<Vec<_>>>()?,
+            })
+        })
+        .collect()
+}
+
+fn files_index_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(FILES_INDEX_FILE)
+}
+
+fn tags_index_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(TAGS_INDEX_FILE)
+}
+
+impl StringTableBuilder {
+    fn intern(&mut self, value: &str) -> u32 {
+        match self.ids.entry(value.to_owned()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let id = self.strings.len() as u32;
+                self.strings.push(entry.key().clone());
+                entry.insert(id);
+                id
+            }
+        }
+    }
+}
+
+fn collect_git_changed_paths(root: &Path) -> io::Result<HashSet<String>> {
+    let mut changed = HashSet::new();
+    for args in [
+        &["diff", "--name-only", "--relative"][..],
+        &["diff", "--name-only", "--relative", "--cached"][..],
+        &["ls-files", "--others", "--exclude-standard"][..],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(String::from_utf8_lossy(&output.stderr)));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            changed.insert(normalize_path(Path::new(line)));
+        }
+    }
+
+    Ok(changed)
+}
+
+fn contains_gitignore_change(changed_paths: &HashSet<String>) -> bool {
+    changed_paths
+        .iter()
+        .any(|path| path == ".gitignore" || path.ends_with("/.gitignore"))
+}
+
+fn collect_changed_paths_by_hash(
+    current_map: &HashMap<String, PathBuf>,
+    cached_map: &HashMap<String, CachedFileSummary>,
+) -> io::Result<HashSet<String>> {
+    let mut changed = HashSet::new();
+
+    for (path, absolute_path) in current_map {
+        let hash = compute_file_hash(absolute_path)?;
+        let cached_hash = cached_map.get(path).map(|cached| cached.hash.as_str());
+        if cached_hash != Some(hash.as_str()) {
+            changed.insert(path.clone());
+        }
+    }
+
+    Ok(changed)
+}
+
+fn compute_file_hash(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(fnv1a_hash(&bytes))
+}
+
+fn fnv1a_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn summarize_file(absolute_path: &Path, relative_path: &Path) -> FileSummary {
@@ -1124,12 +1560,17 @@ fn normalize_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{analyze_content, detect_kind, generate_tags, scan_project, summarize_location};
+    use super::{
+        ScanMode, analyze_content, contains_gitignore_change, detect_kind, files_index_path,
+        generate_tags, load_tags_index, scan_project_with_mode, summarize_location,
+        tags_index_path,
+    };
 
     fn temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1290,7 +1731,7 @@ fn parse_fixture() -> &'static str {
         fs::write(root.join("ignored-dir").join("nested.txt"), "ignore")
             .expect("should write nested ignored file");
 
-        let result = scan_project(&root).expect("scan should succeed");
+        let result = scan_project_with_mode(&root, ScanMode::Full).expect("scan should succeed");
         let scanned = result
             .files
             .iter()
@@ -1306,6 +1747,17 @@ fn parse_fixture() -> &'static str {
     }
 
     #[test]
+    fn detects_root_and_nested_gitignore_changes() {
+        let root_gitignore = HashSet::from([".gitignore".to_owned()]);
+        let nested_gitignore = HashSet::from(["packages/app/.gitignore".to_owned()]);
+        let unrelated = HashSet::from(["src/main.rs".to_owned()]);
+
+        assert!(contains_gitignore_change(&root_gitignore));
+        assert!(contains_gitignore_change(&nested_gitignore));
+        assert!(!contains_gitignore_change(&unrelated));
+    }
+
+    #[test]
     fn scan_project_excludes_git_directory_contents() {
         let root = temp_path("exclude-dot-git");
         fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
@@ -1315,7 +1767,7 @@ fn parse_fixture() -> &'static str {
         fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
             .expect("should write source file");
 
-        let result = scan_project(&root).expect("scan should succeed");
+        let result = scan_project_with_mode(&root, ScanMode::Full).expect("scan should succeed");
         let scanned = result
             .files
             .iter()
@@ -1324,6 +1776,131 @@ fn parse_fixture() -> &'static str {
 
         assert!(scanned.contains(&"src/main.rs"));
         assert!(!scanned.contains(&".git/HEAD"));
+
+        fs::remove_dir_all(root).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn incremental_scan_persists_index_and_updates_changed_files() {
+        let root = temp_path("incremental-update");
+        fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
+        fs::create_dir_all(root.join("src")).expect("should create src dir");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("should write source file");
+
+        let first = scan_project_with_mode(&root, ScanMode::Incremental)
+            .expect("first incremental scan should succeed");
+        assert!(files_index_path(&root).exists());
+        assert!(tags_index_path(&root).exists());
+        assert!(
+            !first
+                .files
+                .iter()
+                .any(|file| file.path.starts_with(".proj-finder/"))
+        );
+
+        fs::write(
+            root.join("src").join("main.rs"),
+            "use reqwest::Client;\nfn main() {}\n",
+        )
+        .expect("should update source file");
+
+        let second = scan_project_with_mode(&root, ScanMode::Incremental)
+            .expect("second incremental scan should succeed");
+        let main_file = second
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.rs")
+            .expect("main file should exist");
+        let imports = &main_file
+            .content_summary
+            .as_ref()
+            .expect("main file should have content summary")
+            .imports;
+
+        assert!(imports.contains(&"reqwest::client".to_owned()));
+
+        fs::remove_dir_all(root).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn persisted_tags_index_deduplicates_values_and_builds_postings() {
+        let root = temp_path("tag-index");
+        fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
+        fs::create_dir_all(root.join("src")).expect("should create src dir");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("should write main file");
+        fs::write(root.join("src").join("lib.rs"), "pub fn run() {}\n")
+            .expect("should write library file");
+
+        scan_project_with_mode(&root, ScanMode::Incremental)
+            .expect("incremental scan should succeed");
+        let tags_index = load_tags_index(&root)
+            .expect("tag index should load")
+            .expect("tag index should exist");
+
+        assert_eq!(
+            tags_index
+                .strings
+                .iter()
+                .filter(|value| value.as_str() == "lang:rust")
+                .count(),
+            1
+        );
+
+        let lang_rust_id = tags_index
+            .strings
+            .iter()
+            .position(|value| value == "lang:rust")
+            .expect("lang:rust should be interned") as u32;
+        let posting = tags_index
+            .inverted_index
+            .iter()
+            .find(|posting| posting.value_id == lang_rust_id)
+            .expect("lang:rust should have a posting list");
+        assert_eq!(posting.file_indices.len(), 2);
+
+        fs::remove_dir_all(root).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn incremental_scan_removes_deleted_files() {
+        let root = temp_path("incremental-remove");
+        fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
+        fs::create_dir_all(root.join("src")).expect("should create src dir");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("should write main file");
+        fs::write(root.join("src").join("lib.rs"), "pub fn run() {}\n")
+            .expect("should write library file");
+
+        scan_project_with_mode(&root, ScanMode::Incremental)
+            .expect("first incremental scan should succeed");
+        fs::remove_file(root.join("src").join("lib.rs")).expect("should remove library file");
+
+        let second = scan_project_with_mode(&root, ScanMode::Incremental)
+            .expect("second incremental scan should succeed");
+
+        assert!(second.files.iter().any(|file| file.path == "src/main.rs"));
+        assert!(!second.files.iter().any(|file| file.path == "src/lib.rs"));
+
+        fs::remove_dir_all(root).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn incremental_scan_falls_back_when_index_is_invalid() {
+        let root = temp_path("incremental-invalid-index");
+        fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
+        fs::create_dir_all(root.join("src")).expect("should create src dir");
+        fs::create_dir_all(root.join(".proj-finder")).expect("should create index dir");
+        fs::write(root.join(".proj-finder").join("files.bin"), "not-bincode")
+            .expect("should write invalid index");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("should write source file");
+
+        let result = scan_project_with_mode(&root, ScanMode::Incremental)
+            .expect("incremental scan should fall back to full scan");
+
+        assert!(result.files.iter().any(|file| file.path == "src/main.rs"));
 
         fs::remove_dir_all(root).expect("should clean up temp dir");
     }

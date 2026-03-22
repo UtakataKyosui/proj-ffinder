@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use model::SearchQuery;
+use scanner::ScanMode;
 
 #[derive(Debug, Parser)]
 #[command(name = "proj-finder")]
@@ -30,12 +31,16 @@ enum Command {
     Scan {
         #[arg(value_name = "ROOT")]
         root: Option<PathBuf>,
+        #[arg(long)]
+        incremental: bool,
     },
     Search {
         #[arg(value_name = "ROOT")]
         root: Option<PathBuf>,
         #[arg(long, value_name = "JSON")]
         query: String,
+        #[arg(long)]
+        incremental: bool,
     },
 }
 
@@ -43,26 +48,44 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Scan { root }) => run_scan(root)?,
-        Some(Command::Search { root, query }) => run_search(root, &query)?,
-        None => run_scan(cli.root)?,
+        Some(Command::Scan { root, incremental }) => run_scan(root, incremental)?,
+        Some(Command::Search {
+            root,
+            query,
+            incremental,
+        }) => run_search(root, &query, incremental)?,
+        None => run_scan(cli.root, false)?,
     }
 
     println!();
     Ok(())
 }
 
-fn run_scan(root: Option<PathBuf>) -> Result<(), Box<dyn Error>> {
+fn run_scan(root: Option<PathBuf>, incremental: bool) -> Result<(), Box<dyn Error>> {
     let root = resolve_repo_root(root)?;
-    let scan_result = scanner::scan_project(&root)?;
+    let mode = if incremental {
+        ScanMode::Incremental
+    } else {
+        ScanMode::Full
+    };
+    let scan_result = scanner::scan_project_with_mode(&root, mode)?;
     serde_json::to_writer_pretty(std::io::stdout(), &scan_result)?;
     Ok(())
 }
 
-fn run_search(root: Option<PathBuf>, query_json: &str) -> Result<(), Box<dyn Error>> {
+fn run_search(
+    root: Option<PathBuf>,
+    query_json: &str,
+    incremental: bool,
+) -> Result<(), Box<dyn Error>> {
     let root = resolve_repo_root(root)?;
     let query = serde_json::from_str::<SearchQuery>(query_json)?;
-    let scan_result = scanner::scan_project(&root)?;
+    let mode = if incremental {
+        ScanMode::Incremental
+    } else {
+        ScanMode::Full
+    };
+    let scan_result = scanner::scan_project_with_mode(&root, mode)?;
     let search_result = search::search_files(&scan_result.root, &scan_result.files, query);
 
     serde_json::to_writer_pretty(std::io::stdout(), &search_result)?;
