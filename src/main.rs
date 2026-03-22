@@ -9,11 +9,40 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use log::{Level, LevelFilter, Metadata, Record};
 use model::{GrepMode, GrepQuery, SearchQuery};
 use scanner::ScanMode;
+
+struct StderrLogger;
+
+static LOGGER: StderrLogger = StderrLogger;
+static LOGGER_INIT: OnceLock<()> = OnceLock::new();
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let _ = writeln!(
+            io::stderr(),
+            "{}: {}",
+            level_prefix(record.level()),
+            record.args()
+        );
+    }
+
+    fn flush(&self) {}
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum SearchDisplay {
@@ -233,6 +262,7 @@ enum Command {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    init_logging();
     let cli = Cli::parse();
 
     match cli.command {
@@ -248,6 +278,38 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!();
     Ok(())
+}
+
+fn init_logging() {
+    LOGGER_INIT.get_or_init(|| {
+        let level = std::env::var("PROJ_FINDER_LOG")
+            .ok()
+            .and_then(|value| parse_log_level(&value))
+            .unwrap_or(LevelFilter::Warn);
+        let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(level));
+    });
+}
+
+fn parse_log_level(value: &str) -> Option<LevelFilter> {
+    match value.to_ascii_lowercase().as_str() {
+        "off" => Some(LevelFilter::Off),
+        "error" => Some(LevelFilter::Error),
+        "warn" | "warning" => Some(LevelFilter::Warn),
+        "info" => Some(LevelFilter::Info),
+        "debug" => Some(LevelFilter::Debug),
+        "trace" => Some(LevelFilter::Trace),
+        _ => None,
+    }
+}
+
+fn level_prefix(level: Level) -> &'static str {
+    match level {
+        Level::Error => "error",
+        Level::Warn => "warn",
+        Level::Info => "info",
+        Level::Debug => "debug",
+        Level::Trace => "trace",
+    }
 }
 
 fn run_scan(root: Option<PathBuf>, incremental: bool) -> Result<(), Box<dyn Error>> {

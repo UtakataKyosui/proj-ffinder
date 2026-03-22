@@ -11,6 +11,9 @@ use crate::model::{
 };
 use crate::scanner;
 
+const MAX_SUGGESTED_TAGS: usize = 5;
+const MAX_SAMPLED_PATHS_PER_TAG: usize = 2;
+
 struct PreparedGrep {
     query: GrepQuery,
     matcher: regex::Regex,
@@ -285,7 +288,9 @@ fn build_search_assistance(
             }
             *tag_counts.entry(tag.value.clone()).or_default() += 1;
             let paths = sample_paths.entry(tag.value.clone()).or_default();
-            if paths.len() < 2 && !paths.iter().any(|path| path == &input.path) {
+            if paths.len() < MAX_SAMPLED_PATHS_PER_TAG
+                && !paths.iter().any(|path| path == &input.path)
+            {
                 paths.push(input.path.clone());
             }
         }
@@ -306,7 +311,7 @@ fn build_search_assistance(
             .then_with(|| tag_priority(&left.value).cmp(&tag_priority(&right.value)))
             .then_with(|| left.value.cmp(&right.value))
     });
-    suggested_tags.truncate(5);
+    suggested_tags.truncate(MAX_SUGGESTED_TAGS);
 
     let suggested_commands = build_suggested_commands(root, query, &suggested_tags);
 
@@ -322,23 +327,26 @@ fn build_suggested_commands(
     suggested_tags: &[SuggestedTag],
 ) -> Vec<SuggestedCommand> {
     let mut commands = Vec::new();
-    let root_hint = if root == Path::new(".") {
+    let root_hint = shell_quote(if root == Path::new(".") {
         ".".to_owned()
     } else {
         root.display().to_string()
-    };
+    });
 
     if let Some(first) = suggested_tags.first() {
+        let first_tag = shell_quote(&first.value);
         commands.push(SuggestedCommand {
             description: format!("narrow with {}", first.value),
             command: format!(
                 "proj-finder search {root_hint} --must {} --limit {}",
-                first.value, query.limit
+                first_tag, query.limit
             ),
         });
     }
 
     if suggested_tags.len() >= 2 {
+        let first_tag = shell_quote(&suggested_tags[0].value);
+        let second_tag = shell_quote(&suggested_tags[1].value);
         commands.push(SuggestedCommand {
             description: format!(
                 "narrow with {} and {}",
@@ -346,12 +354,28 @@ fn build_suggested_commands(
             ),
             command: format!(
                 "proj-finder search {root_hint} --must {} --must {} --limit {}",
-                suggested_tags[0].value, suggested_tags[1].value, query.limit
+                first_tag, second_tag, query.limit
             ),
         });
     }
 
     commands
+}
+
+fn shell_quote(value: impl AsRef<str>) -> String {
+    let value = value.as_ref();
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+
+    if value
+        .bytes()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b':' | b'-'))
+    {
+        return value.to_owned();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn is_suggestible_tag(value: &str) -> bool {
@@ -436,13 +460,17 @@ fn context_lines(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::model::{FileSummary, GrepMode, GrepQuery, LocationSummary, SearchQuery, Tag};
     use crate::scanner::{self, ScanMode};
 
-    use super::{PreparedGrep, collect_grep_matches_for_path, search_files, search_files_lazy};
+    use super::{
+        PreparedGrep, build_search_assistance, collect_grep_matches_for_path, search_files,
+        search_files_lazy, shell_quote,
+    };
 
     fn temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -770,5 +798,53 @@ mod tests {
         assert!(collect_grep_matches_for_path(&root, "../outside", &grep).is_none());
 
         fs::remove_dir_all(root).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn shell_quote_quotes_paths_with_spaces() {
+        assert_eq!(shell_quote("."), ".");
+        assert_eq!(shell_quote("/tmp/my repo"), "'/tmp/my repo'");
+        assert_eq!(shell_quote("tag:'quoted'"), "'tag:'\"'\"'quoted'\"'\"''");
+    }
+
+    #[test]
+    fn search_assistance_quotes_suggested_commands() {
+        let root = Path::new("/tmp/my repo");
+        let query = SearchQuery {
+            must: vec![],
+            any: vec![],
+            exclude: vec![],
+            prefer: vec![],
+            grep: None,
+            limit: 5,
+        };
+        let inputs = vec![
+            super::AssistanceInput {
+                path: "src/main.rs".to_owned(),
+                tags: vec![Tag {
+                    value: "tech:react app".to_owned(),
+                    source: "test".to_owned(),
+                    confidence: 1.0,
+                    evidence: vec![],
+                }],
+            },
+            super::AssistanceInput {
+                path: "src/app.tsx".to_owned(),
+                tags: vec![Tag {
+                    value: "tech:react app".to_owned(),
+                    source: "test".to_owned(),
+                    confidence: 1.0,
+                    evidence: vec![],
+                }],
+            },
+        ];
+
+        let assistance = build_search_assistance(root, &query, &inputs);
+
+        assert_eq!(assistance.suggested_tags.len(), 1);
+        assert_eq!(
+            assistance.suggested_commands[0].command,
+            "proj-finder search '/tmp/my repo' --must 'tech:react app' --limit 5"
+        );
     }
 }

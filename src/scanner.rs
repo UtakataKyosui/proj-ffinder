@@ -426,15 +426,15 @@ fn load_index(root: &Path) -> io::Result<Option<PersistedIndex>> {
         let path = match shard_path(root, &entry.path) {
             Ok(path) => path,
             Err(error) => {
-                eprintln!("warn: {error}");
+                log::warn!("{error}");
                 return Ok(None);
             }
         };
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!(
-                    "warn: failed to read shard at {}, falling back to full scan: {error}",
+                log::warn!(
+                    "failed to read shard at {}, falling back to full scan: {error}",
                     path.display()
                 );
                 return Ok(None);
@@ -443,8 +443,8 @@ fn load_index(root: &Path) -> io::Result<Option<PersistedIndex>> {
         let shard = match decode_from_slice::<CachedFileSummary, _>(&bytes, standard()) {
             Ok((shard, _)) => shard,
             Err(error) => {
-                eprintln!(
-                    "warn: failed to decode shard at {}, falling back to full scan: {error}",
+                log::warn!(
+                    "failed to decode shard at {}, falling back to full scan: {error}",
                     path.display()
                 );
                 return Ok(None);
@@ -641,16 +641,16 @@ fn load_manifest(root: &Path) -> io::Result<Option<PersistedManifest>> {
             {
                 Ok(Some(manifest))
             } else {
-                eprintln!(
-                    "warn: manifest at {} contains unsafe paths, falling back to full scan",
+                log::warn!(
+                    "manifest at {} contains unsafe paths, falling back to full scan",
                     path.display()
                 );
                 Ok(None)
             }
         }
         Err(error) => {
-            eprintln!(
-                "warn: failed to decode manifest at {}, falling back to full scan: {error}",
+            log::warn!(
+                "failed to decode manifest at {}, falling back to full scan: {error}",
                 path.display()
             );
             Ok(None)
@@ -740,7 +740,7 @@ pub(crate) fn load_cached_summary(
     let path = match shard_path(root, relative_path) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("warn: {error}");
+            log::warn!("{error}");
             return Ok(None);
         }
     };
@@ -752,8 +752,8 @@ pub(crate) fn load_cached_summary(
     match decode_from_slice::<CachedFileSummary, _>(&bytes, standard()) {
         Ok((cached, _)) => Ok(Some(cached.summary)),
         Err(error) => {
-            eprintln!(
-                "warn: failed to decode shard at {}, falling back to full scan: {error}",
+            log::warn!(
+                "failed to decode shard at {}, falling back to full scan: {error}",
                 path.display()
             );
             Ok(None)
