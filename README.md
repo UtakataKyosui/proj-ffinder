@@ -182,6 +182,493 @@ Agent が最初に欲しいのは、実際にはこの層であることが多�
 これはプロジェクトやフレームワークの慣習を強く使う。
 精度が高い反面、言語やフレームワークごとの定義が必要になる。
 
+## プログラム上でどう表現するか
+
+開発を進めやすくするためには、
+「タグを付ける」という曖昧な表現ではなく、
+**各ファイルをどういう構造体に要約するか**
+を先に決めた方がよい。
+
+最低限、1 ファイルにつき以下の 4 層を持つと実装しやすい。
+
+1. ファイルの基本情報
+2. 位置の要約
+3. 内容の要約
+4. その要約から導かれたタグ
+
+### 推奨するファイル要約モデル
+
+概念的には、各ファイルを次のようなレコードで持つ。
+
+```json
+{
+  "file_id": "src/main.rs",
+  "path": "src/main.rs",
+  "language": "rust",
+  "kind": "source",
+  "hash": "sha256:...",
+  "size": 1234,
+  "location_summary": {
+    "depth": 2,
+    "dirs": ["src"],
+    "basename": "main.rs",
+    "stem": "main",
+    "extension": "rs",
+    "path_tokens": ["src", "main", "rs"]
+  },
+  "content_summary": {
+    "imports": [],
+    "exports": [],
+    "symbols": ["main"],
+    "keywords": ["println"],
+    "tech": ["rust"],
+    "roles": ["entrypoint"],
+    "side_effects": ["stdout"],
+    "metrics": {
+      "line_count": 3,
+      "comment_ratio": 0.0
+    }
+  },
+  "tags": [
+    { "value": "dir:src", "source": "path", "confidence": 1.0 },
+    { "value": "ext:rs", "source": "path", "confidence": 1.0 },
+    { "value": "role:entrypoint", "source": "filename", "confidence": 0.9 }
+  ]
+}
+```
+
+重要なのは、
+`content_summary` と `tags` を分けること。
+
+- `content_summary`: 生に近い観測結果
+- `tags`: 探索で直接使う索引
+
+この分離がないと、あとからタグ生成ルールを変えたいときに
+毎回ファイル全文の再解析が必要になりやすい。
+
+### 位置の要約で持つべき項目
+
+位置の要約は軽量で、ほぼ確定情報だけでよい。
+
+- `depth`
+- `dirs`
+- `basename`
+- `stem`
+- `extension`
+- `path_tokens`
+- `path_patterns`
+
+`path_patterns` は、
+`src/features/*/service/*` のようなパターン一致結果を持たせる欄として有効。
+
+例:
+
+- `path-pattern:src/*`
+- `path-pattern:src/features/*`
+- `path-pattern:tests/*`
+
+これがあると、単純なディレクトリ名より少し強い探索条件を作りやすい。
+
+### 内容の要約で持つべき項目
+
+内容の要約は、全文そのものではなく
+**探索に必要な観測値だけを抜き出す**のが重要。
+
+最低限の候補は以下。
+
+- `imports`
+- `exports`
+- `symbols`
+- `keywords`
+- `tech`
+- `roles`
+- `side_effects`
+- `metrics`
+
+ここでの考え方は次の通り。
+
+- `imports`: 何に依存しているか
+- `exports`: 外から何として見えるか
+- `symbols`: 関数名、型名、クラス名など
+- `keywords`: ドメイン語や頻出語
+- `tech`: 使用技術やライブラリ
+- `roles`: 実装責務の推定
+- `side_effects`: DB、HTTP、ファイル I/O など
+- `metrics`: 行数、関数数、コメント比率など
+
+つまり内容要約は、
+「そのファイルが何者か」を短い構造化データで表す層になる。
+
+### タグと根拠を分ける
+
+タグだけ持つと、後からデバッグしづらい。
+そのため、タグには根拠も持たせたい。
+
+例:
+
+```json
+{
+  "value": "role:api-route",
+  "source": "convention",
+  "confidence": 0.95,
+  "evidence": ["basename=route.ts", "dir=app/api"]
+}
+```
+
+この `evidence` があると、
+
+- なぜそのタグが付いたか
+- 誤判定の原因は何か
+- どのルールを修正すべきか
+
+を追いやすい。
+
+## 抽出パイプライン
+
+実装としては、1 回の解析で全部賢くやろうとするより、
+段階的なパイプラインにした方がよい。
+
+推奨する流れは以下。
+
+1. ファイル列挙
+2. 除外判定
+3. 位置要約の生成
+4. 軽量内容解析
+5. 必要な場合のみ AST 解析
+6. タグ生成
+7. 索引の保存
+
+### 1. ファイル列挙
+
+まずはプロジェクト配下のファイル一覧を作る。
+
+ここでは以下を取り出せればよい。
+
+- 相対パス
+- サイズ
+- 更新時刻
+- ハッシュ
+
+ハッシュを持っておくと、差分更新がやりやすい。
+
+### 2. 除外判定
+
+全文解析の前に、読まなくてよいファイルを切る。
+
+例:
+
+- `node_modules`
+- `.git`
+- `target`
+- `dist`
+- `coverage`
+- lockfile
+- binary
+
+この判定はかなり重要で、
+探索精度というより **インデックス生成コスト** に効く。
+
+### 3. 位置要約の生成
+
+ここでパス由来の情報をすべて作る。
+
+- ディレクトリ列
+- 深さ
+- basename / stem / ext
+- パスパターン一致
+
+この段階だけで、決定的タグのかなりの部分を作れる。
+
+### 4. 軽量内容解析
+
+まずは AST を使わず、安価な抽出だけを行う。
+
+例:
+
+- import / use / require の抽出
+- 頻出語の抽出
+- 予約済みキーワード辞書との照合
+- ファイル先頭数 KB の簡易スキャン
+
+この段階は MVP に向いている。
+初期実装では、ここが主戦力になる。
+
+### 5. 必要な場合のみ AST 解析
+
+拡張子や言語が対応しているものだけ、
+追加で AST ベースの解析を行う。
+
+例:
+
+- Rust なら `fn`, `struct`, `enum`, `mod`, `use`
+- TypeScript なら `import`, `export`, `function`, `class`
+- Python なら `import`, `def`, `class`
+
+ここでは、
+文字列検索では不安定な `symbols`, `exports`, `roles` を補強する。
+
+### 6. タグ生成
+
+観測値からタグを作る処理は、抽出とは別段にした方がよい。
+
+つまり、
+
+- 解析器は観測値を返す
+- ルールエンジンがタグを作る
+
+という分離を保つ。
+
+この分離があると、
+解析ロジックを変えずにタグ付与ルールだけ調整できる。
+
+### 7. 索引の保存
+
+最終的には、
+
+- ファイル単位の要約
+- タグからファイルを引く逆引き索引
+
+の両方を持つとよい。
+
+## 保存形式の考え方
+
+開発しやすさを優先するなら、最初は `JSONL` が扱いやすい。
+
+- `files.jsonl`: 1 行 1 ファイルの要約
+- `tags.jsonl`: 1 行 1 タグ付与イベント
+
+この形なら、途中でスキーマを変えやすく、
+デバッグもしやすい。
+
+ただし検索速度を上げたくなった段階では、
+次のどちらかに進むのが自然。
+
+- `SQLite` に寄せる
+- インメモリの inverted index を作る
+
+最初から複雑な検索エンジンにしない方がよい。
+このプロジェクトの初期課題は検索速度より、
+**適切な要約項目とタグ設計を見つけること**だからである。
+
+## 検索クエリのプログラム表現
+
+Agent がタグ検索を使うなら、
+自然言語をそのまま投げるのではなく
+構造化クエリへ一度変換した方がよい。
+
+たとえば、以下のような入力モデルを持てる。
+
+```json
+{
+  "must": ["role:api-route"],
+  "any": ["kw:auth", "kw:login"],
+  "exclude": ["kind:generated", "kind:vendor"],
+  "prefer": ["dir:src", "tech:http"],
+  "limit": 10
+}
+```
+
+この形なら、Agent 側は
+
+- 必須条件
+- 代替条件
+- 除外条件
+- 加点条件
+
+を明確に分けて検索できる。
+
+### スコアリングの最小設計
+
+最初は単純な加点式で十分。
+
+- `must` を満たさないものは除外
+- `exclude` を持つものは除外
+- `any` の一致数で加点
+- `prefer` の一致数で加点
+- `confidence` の合計で微調整
+
+重要なのは、高度なランキング理論ではなく、
+**なぜそのファイルが上位に来たか説明できること**である。
+
+## 更新方式
+
+毎回フルリビルドすると重くなるため、
+差分更新を前提にした方がよい。
+
+基本方針:
+
+- 新規ファイルは追加解析
+- ハッシュが変わったファイルだけ再解析
+- 消えたファイルは索引から削除
+
+このため、各ファイル要約には少なくとも
+`path` と `hash` が必要になる。
+
+## 実装の最小単位
+
+最初の実装で全部やる必要はない。
+むしろ、以下を最小単位として切ると進めやすい。
+
+1. ファイル列挙器
+2. 除外ルール
+3. 位置要約器
+4. 軽量内容要約器
+5. タグ生成器
+6. タグ検索器
+
+この分割にしておけば、
+各段階を単体テストしやすくなる。
+
+特に最初は、
+`位置要約だけでどこまで探せるか`
+を測れるようにしておくべきである。
+
+## 現在の MVP
+
+現在の実装は、このうち以下を持つ。
+
+1. ファイル列挙
+2. 除外ルール
+3. 位置要約器
+4. 軽量内容要約器
+5. 位置情報と内容要約の両方を使うタグ生成器
+6. Rust / TypeScript / Python / Go に対する部分 AST 解析
+
+まだ行っていないもの:
+
+- 差分更新
+
+現在はこれに加えて、
+**タグに対する構造化検索器** を持つ。
+
+### 部分 AST 解析
+
+現在は以下の言語に対して、
+部分 AST 解析を行う。
+
+- Rust: `syn`
+- TypeScript: `tree-sitter-typescript`
+- Python: `tree-sitter-python`
+- Go: `tree-sitter-go`
+
+ここで補強しているもの:
+
+- `imports`
+- `exports`
+- `symbols`
+- `roles`
+
+Rust では特に、
+
+- `use`
+- `pub` アイテム
+- 関数、型、モジュール、メソッド
+- `fn main`, `#[test]`, `#[cfg(test)] mod tests`
+
+を AST から拾う。
+
+TypeScript / Python / Go でも、
+言語ごとの import 文、宣言ノード、テスト系パターン、entrypoint パターンを
+AST ベースで拾うため、
+単純な文字列スキャンより安定して
+`import:*`, `export:*`, `symbol:*`, `role:*`
+を生成できる。
+
+### 現在の出力
+
+`scan` はプロジェクトルートを走査し、
+各ファイルについて以下を JSON で出力する。
+
+- `path`
+- `language`
+- `kind`
+- `location_summary`
+- `content_summary`
+- `tags`
+
+### 使い方
+
+```bash
+cargo run -- scan .
+```
+
+CLI は `clap` ベースで、
+`scan` と `search` をサブコマンドとして持つ。
+
+引数を省略した場合は、
+カレントディレクトリから上方向に `.git` を探し、
+見つかったリポジトリルートを走査する。
+
+引数を渡した場合も、
+そのパス自身ではなく、そのパスから上方向に `.git` を探して
+リポジトリルートを確定する。
+
+走査対象外のファイルやディレクトリは、
+基本的にそのリポジトリの `.gitignore` に従う。
+
+旧来の `cargo run -- .` も、互換のため `scan` として扱う。
+
+### 検索の使い方
+
+検索は、構造化クエリを JSON で渡す。
+
+```bash
+cargo run -- search . --query '{"must":["role:docs"],"prefer":["ext:md"],"limit":5}'
+```
+
+クエリの形式:
+
+```json
+{
+  "must": ["role:api-route"],
+  "any": ["kw:auth", "kw:login"],
+  "exclude": ["kind:generated", "kind:vendor"],
+  "prefer": ["dir:src", "tech:http"],
+  "limit": 10
+}
+```
+
+`search` の結果には、各ヒットについて
+
+- `score`
+- `matched_must`
+- `matched_any`
+- `matched_prefer`
+
+が含まれる。
+
+これにより、なぜそのファイルが候補に残ったかを追いやすい。
+現在は `role:*`, `dir:*`, `ext:*` に加えて、
+`kw:*`, `tech:*`, `side-effect:*`, `import:*`, `export:*`, `symbol:*`
+でも検索できる。
+
+### CI / Release
+
+GitHub Actions では、
+`.github/workflows/checks.yml`
+に `fmt` / `clippy` / `test`
+を reusable workflow として切り出している。
+
+`.github/workflows/ci.yml`
+は push / pull_request 時にこのチェックを実行する。
+
+`.github/workflows/release.yml`
+は `v*` タグ push 時に同じチェックを先に実行し、
+通過した場合のみ `cargo build --release`
+で Linux 向けバイナリを作成して
+GitHub Release を公開する。
+
+Release には自動生成された release notes と、
+`proj-finder-<tag>-<target>.tar.gz`
+を添付する。
+
+例:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Agent の探索フロー
 
 Agent がタグを使って探索する場合の基本フローは以下。

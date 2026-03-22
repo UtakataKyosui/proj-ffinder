@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: checks
+    env:
+      BIN_NAME: proj-finder
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked
+      - id: package
+        name: Package release asset
+        run: |
+          set -euo pipefail
+          TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          DIST_DIR="dist"
+          ARCHIVE_NAME="${BIN_NAME}-${GITHUB_REF_NAME}-${TARGET}.tar.gz"
+          mkdir -p "${DIST_DIR}"
+          cp "target/release/${BIN_NAME}" "${DIST_DIR}/${BIN_NAME}"
+          cp README.md "${DIST_DIR}/README.md"
+          tar -czf "${DIST_DIR}/${ARCHIVE_NAME}" -C "${DIST_DIR}" "${BIN_NAME}" README.md
+          echo "archive=${DIST_DIR}/${ARCHIVE_NAME}" >> "${GITHUB_OUTPUT}"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${{ steps.package.outputs.archive }}" \
+            --verify-tag \
+            --generate-notes
