@@ -63,11 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn run_scan(root: Option<PathBuf>, incremental: bool) -> Result<(), Box<dyn Error>> {
     let root = resolve_repo_root(root)?;
-    let scan_result = if incremental {
-        scanner::scan_project_with_mode(&root, ScanMode::Incremental)?
+    let mode = if incremental {
+        ScanMode::Incremental
     } else {
-        scanner::scan_project(&root)?
+        ScanMode::Full
     };
+    let scan_result = scanner::scan_project_with_mode(&root, mode)?;
     serde_json::to_writer_pretty(std::io::stdout(), &scan_result)?;
     Ok(())
 }
@@ -79,11 +80,12 @@ fn run_search(
 ) -> Result<(), Box<dyn Error>> {
     let root = resolve_repo_root(root)?;
     let query = serde_json::from_str::<SearchQuery>(query_json)?;
-    let scan_result = if incremental {
-        scanner::scan_project_with_mode(&root, ScanMode::Incremental)?
+    let mode = if incremental {
+        ScanMode::Incremental
     } else {
-        scanner::scan_project(&root)?
+        ScanMode::Full
     };
+    let scan_result = scanner::scan_project_with_mode(&root, mode)?;
     let search_result = search::search_files(&scan_result.root, &scan_result.files, query);
 
     serde_json::to_writer_pretty(std::io::stdout(), &search_result)?;

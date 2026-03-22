@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -86,10 +87,6 @@ struct StringTableBuilder {
     ids: HashMap<String, u32>,
 }
 
-pub fn scan_project(root: &Path) -> io::Result<ScanResult> {
-    scan_project_with_mode(root, ScanMode::Full)
-}
-
 pub fn scan_project_with_mode(root: &Path, mode: ScanMode) -> io::Result<ScanResult> {
     let root = root.canonicalize()?;
     match mode {
@@ -144,12 +141,7 @@ fn incremental_scan(root: &Path) -> io::Result<ScanResult> {
         .collect::<HashMap<_, _>>();
 
     let changed_paths = match collect_git_changed_paths(root) {
-        Ok(changed)
-            if !changed.contains(".gitignore")
-                && !changed.iter().any(|path| path.starts_with(".gitignore/")) =>
-        {
-            changed
-        }
+        Ok(changed) if !contains_gitignore_change(&changed) => changed,
         _ => collect_changed_paths_by_hash(&current_map, &cached_map)?,
     };
 
@@ -311,10 +303,16 @@ fn load_files_index(root: &Path) -> io::Result<Option<PersistedFilesIndex>> {
         return Ok(None);
     }
 
-    let bytes = fs::read(path)?;
+    let bytes = fs::read(&path)?;
     match decode_from_slice::<PersistedFilesIndex, _>(&bytes, standard()) {
         Ok((index, _)) => Ok(Some(index)),
-        Err(_) => Ok(None),
+        Err(error) => {
+            eprintln!(
+                "warn: failed to decode files index at {}, falling back to full scan: {error}",
+                path.display()
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -324,10 +322,16 @@ fn load_tags_index(root: &Path) -> io::Result<Option<PersistedTagsIndex>> {
         return Ok(None);
     }
 
-    let bytes = fs::read(path)?;
+    let bytes = fs::read(&path)?;
     match decode_from_slice::<PersistedTagsIndex, _>(&bytes, standard()) {
         Ok((index, _)) => Ok(Some(index)),
-        Err(_) => Ok(None),
+        Err(error) => {
+            eprintln!(
+                "warn: failed to decode tags index at {}, falling back to full scan: {error}",
+                path.display()
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -406,14 +410,15 @@ fn tags_index_path(root: &Path) -> PathBuf {
 
 impl StringTableBuilder {
     fn intern(&mut self, value: &str) -> u32 {
-        if let Some(id) = self.ids.get(value) {
-            return *id;
+        match self.ids.entry(value.to_owned()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let id = self.strings.len() as u32;
+                self.strings.push(entry.key().clone());
+                entry.insert(id);
+                id
+            }
         }
-        let id = self.strings.len() as u32;
-        let owned = value.to_owned();
-        self.strings.push(owned.clone());
-        self.ids.insert(owned, id);
-        id
     }
 }
 
@@ -444,6 +449,12 @@ fn collect_git_changed_paths(root: &Path) -> io::Result<HashSet<String>> {
     }
 
     Ok(changed)
+}
+
+fn contains_gitignore_change(changed_paths: &HashSet<String>) -> bool {
+    changed_paths
+        .iter()
+        .any(|path| path == ".gitignore" || path.ends_with("/.gitignore"))
 }
 
 fn collect_changed_paths_by_hash(
@@ -1545,14 +1556,16 @@ fn normalize_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ScanMode, analyze_content, detect_kind, files_index_path, generate_tags, load_tags_index,
-        scan_project, scan_project_with_mode, summarize_location, tags_index_path,
+        ScanMode, analyze_content, contains_gitignore_change, detect_kind, files_index_path,
+        generate_tags, load_tags_index, scan_project_with_mode, summarize_location,
+        tags_index_path,
     };
 
     fn temp_path(name: &str) -> PathBuf {
@@ -1714,7 +1727,7 @@ fn parse_fixture() -> &'static str {
         fs::write(root.join("ignored-dir").join("nested.txt"), "ignore")
             .expect("should write nested ignored file");
 
-        let result = scan_project(&root).expect("scan should succeed");
+        let result = scan_project_with_mode(&root, ScanMode::Full).expect("scan should succeed");
         let scanned = result
             .files
             .iter()
@@ -1730,6 +1743,17 @@ fn parse_fixture() -> &'static str {
     }
 
     #[test]
+    fn detects_root_and_nested_gitignore_changes() {
+        let root_gitignore = HashSet::from([".gitignore".to_owned()]);
+        let nested_gitignore = HashSet::from(["packages/app/.gitignore".to_owned()]);
+        let unrelated = HashSet::from(["src/main.rs".to_owned()]);
+
+        assert!(contains_gitignore_change(&root_gitignore));
+        assert!(contains_gitignore_change(&nested_gitignore));
+        assert!(!contains_gitignore_change(&unrelated));
+    }
+
+    #[test]
     fn scan_project_excludes_git_directory_contents() {
         let root = temp_path("exclude-dot-git");
         fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
@@ -1739,7 +1763,7 @@ fn parse_fixture() -> &'static str {
         fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
             .expect("should write source file");
 
-        let result = scan_project(&root).expect("scan should succeed");
+        let result = scan_project_with_mode(&root, ScanMode::Full).expect("scan should succeed");
         let scanned = result
             .files
             .iter()
