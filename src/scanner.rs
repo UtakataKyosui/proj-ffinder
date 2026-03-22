@@ -423,7 +423,13 @@ fn load_index(root: &Path) -> io::Result<Option<PersistedIndex>> {
 
     let mut files = Vec::with_capacity(manifest.files.len());
     for entry in &manifest.files {
-        let path = shard_path(root, &entry.path);
+        let path = match shard_path(root, &entry.path) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("warn: {error}");
+                return Ok(None);
+            }
+        };
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -493,7 +499,7 @@ fn persist_index(
     };
 
     for file in files {
-        let shard = shard_path(root, &file.path);
+        let shard = shard_path(root, &file.path)?;
         let should_write = previous_hashes
             .get(&file.path)
             .map(|hash| hash != &file.hash)
@@ -521,7 +527,7 @@ fn persist_index(
             if next_paths.contains(entry.path.as_str()) {
                 continue;
             }
-            let shard = shard_path(root, &entry.path);
+            let shard = shard_path(root, &entry.path)?;
             if shard.exists() {
                 fs::remove_file(&shard)?;
                 remove_empty_parent_dirs(&shard, &shards_dir)?;
@@ -560,7 +566,7 @@ fn persist_index_delta(
     fs::create_dir_all(&shards_dir)?;
 
     for file in updated_files.values() {
-        let shard = shard_path(root, &file.path);
+        let shard = shard_path(root, &file.path)?;
         if let Some(parent) = shard.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -570,7 +576,7 @@ fn persist_index_delta(
     }
 
     for path in &removed_paths {
-        let shard = shard_path(root, path);
+        let shard = shard_path(root, path)?;
         if shard.exists() {
             fs::remove_file(&shard)?;
             remove_empty_parent_dirs(&shard, &shards_dir)?;
@@ -627,7 +633,21 @@ fn load_manifest(root: &Path) -> io::Result<Option<PersistedManifest>> {
 
     let bytes = fs::read(&path)?;
     match decode_from_slice::<PersistedManifest, _>(&bytes, standard()) {
-        Ok((manifest, _)) => Ok(Some(manifest)),
+        Ok((manifest, _)) => {
+            if manifest
+                .files
+                .iter()
+                .all(|entry| safe_relative_path(&entry.path).is_some())
+            {
+                Ok(Some(manifest))
+            } else {
+                eprintln!(
+                    "warn: manifest at {} contains unsafe paths, falling back to full scan",
+                    path.display()
+                );
+                Ok(None)
+            }
+        }
         Err(error) => {
             eprintln!(
                 "warn: failed to decode manifest at {}, falling back to full scan: {error}",
@@ -642,14 +662,50 @@ fn manifest_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(MANIFEST_FILE)
 }
 
-fn shard_path(root: &Path, relative_path: &str) -> PathBuf {
+// Only allow normalized project-relative paths that stay inside the cache or
+// repository root when joined later.
+pub(crate) fn safe_relative_path(relative_path: &str) -> Option<PathBuf> {
+    let path = Path::new(relative_path);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => return None,
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+pub(crate) fn join_safe_relative_path(root: &Path, relative_path: &str) -> Option<PathBuf> {
+    safe_relative_path(relative_path).map(|path| root.join(path))
+}
+
+fn shard_path(root: &Path, relative_path: &str) -> io::Result<PathBuf> {
+    let relative_path = safe_relative_path(relative_path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsafe relative path in cache index: {relative_path}"),
+        )
+    })?;
     let mut shard = root.join(INDEX_DIR).join(SHARDS_DIR).join(relative_path);
     let file_name = shard
         .file_name()
         .and_then(|name| name.to_str())
         .expect("relative path should end with a file name");
     shard.set_file_name(format!("{file_name}.bin"));
-    shard
+    Ok(shard)
 }
 
 fn remove_empty_parent_dirs(path: &Path, stop_at: &Path) -> io::Result<()> {
@@ -681,7 +737,13 @@ pub(crate) fn load_cached_summary(
     root: &Path,
     relative_path: &str,
 ) -> io::Result<Option<FileSummary>> {
-    let path = shard_path(root, relative_path);
+    let path = match shard_path(root, relative_path) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("warn: {error}");
+            return Ok(None);
+        }
+    };
     if !path.exists() {
         return Ok(None);
     }
@@ -1947,9 +2009,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ScanMode, analyze_content, contains_gitignore_change, detect_kind, generate_tags,
-        load_manifest, manifest_path, scan_project_with_mode, shard_path, summarize_location,
+        INDEX_VERSION, PersistedManifest, PersistedManifestEntry, ScanMode, analyze_content,
+        contains_gitignore_change, detect_kind, generate_tags, load_manifest, manifest_path,
+        safe_relative_path, scan_project_with_mode, shard_path, summarize_location,
     };
+    use bincode::config::standard;
+    use bincode::serde::encode_to_vec;
 
     fn temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -2167,6 +2232,14 @@ fn parse_fixture() -> &'static str {
     }
 
     #[test]
+    fn safe_relative_path_rejects_unsafe_components() {
+        assert!(safe_relative_path("src/main.rs").is_some());
+        assert!(safe_relative_path("../outside").is_none());
+        assert!(safe_relative_path("/etc/passwd").is_none());
+        assert!(safe_relative_path("./src/main.rs").is_none());
+    }
+
+    #[test]
     fn scan_project_excludes_git_directory_contents() {
         let root = temp_path("exclude-dot-git");
         fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
@@ -2200,7 +2273,11 @@ fn parse_fixture() -> &'static str {
         let first = scan_project_with_mode(&root, ScanMode::Incremental)
             .expect("first incremental scan should succeed");
         assert!(manifest_path(&root).exists());
-        assert!(shard_path(&root, "src/main.rs").exists());
+        assert!(
+            shard_path(&root, "src/main.rs")
+                .expect("shard path should be valid")
+                .exists()
+        );
         assert!(
             !first
                 .files
@@ -2300,8 +2377,16 @@ fn parse_fixture() -> &'static str {
                 .iter()
                 .any(|entry| entry.path == "src/lib.rs")
         );
-        assert!(shard_path(&root, "src/main.rs").exists());
-        assert!(shard_path(&root, "src/lib.rs").exists());
+        assert!(
+            shard_path(&root, "src/main.rs")
+                .expect("shard path should be valid")
+                .exists()
+        );
+        assert!(
+            shard_path(&root, "src/lib.rs")
+                .expect("shard path should be valid")
+                .exists()
+        );
 
         fs::remove_dir_all(root).expect("should clean up temp dir");
     }
@@ -2325,7 +2410,11 @@ fn parse_fixture() -> &'static str {
 
         assert!(second.files.iter().any(|file| file.path == "src/main.rs"));
         assert!(!second.files.iter().any(|file| file.path == "src/lib.rs"));
-        assert!(!shard_path(&root, "src/lib.rs").exists());
+        assert!(
+            !shard_path(&root, "src/lib.rs")
+                .expect("shard path should be valid")
+                .exists()
+        );
 
         fs::remove_dir_all(root).expect("should clean up temp dir");
     }
@@ -2348,6 +2437,32 @@ fn parse_fixture() -> &'static str {
             .expect("incremental scan should fall back to full scan");
 
         assert!(result.files.iter().any(|file| file.path == "src/main.rs"));
+
+        fs::remove_dir_all(root).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn load_manifest_rejects_unsafe_paths() {
+        let root = temp_path("unsafe-manifest");
+        fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
+        fs::create_dir_all(root.join(".proj-finder")).expect("should create index dir");
+        let manifest = PersistedManifest {
+            version: INDEX_VERSION,
+            root: root.display().to_string(),
+            git_head: None,
+            files: vec![PersistedManifestEntry {
+                path: "../outside".to_owned(),
+                hash: "hash".to_owned(),
+            }],
+        };
+        let bytes = encode_to_vec(&manifest, standard()).expect("manifest should encode");
+        fs::write(manifest_path(&root), bytes).expect("should write manifest");
+
+        assert!(
+            load_manifest(&root)
+                .expect("manifest load should not error")
+                .is_none()
+        );
 
         fs::remove_dir_all(root).expect("should clean up temp dir");
     }

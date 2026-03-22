@@ -10,6 +10,8 @@ const COLOR_PATH: &str = "\x1b[1;34m";
 const COLOR_MATCH: &str = "\x1b[30;43m";
 const COLOR_LINE_NUMBER: &str = "\x1b[2m";
 const COLOR_LABEL: &str = "\x1b[35m";
+const DISPLAYED_SUGGESTED_TAGS: usize = 3;
+const DISPLAYED_SUGGESTED_COMMANDS: usize = 2;
 
 pub fn format_search_result(
     result: &SearchResult,
@@ -135,7 +137,12 @@ pub fn format_search_result(
         writeln!(out).expect("writing to string should succeed");
         writeln!(out, "{}", colorize(COLOR_LABEL, "suggest", color))
             .expect("writing to string should succeed");
-        for suggestion in result.assistance.suggested_tags.iter().take(3) {
+        for suggestion in result
+            .assistance
+            .suggested_tags
+            .iter()
+            .take(DISPLAYED_SUGGESTED_TAGS)
+        {
             writeln!(
                 out,
                 "  {}  {} hit(s){}",
@@ -155,7 +162,12 @@ pub fn format_search_result(
         writeln!(out).expect("writing to string should succeed");
         writeln!(out, "{}", colorize(COLOR_LABEL, "try", color))
             .expect("writing to string should succeed");
-        for command in result.assistance.suggested_commands.iter().take(2) {
+        for command in result
+            .assistance
+            .suggested_commands
+            .iter()
+            .take(DISPLAYED_SUGGESTED_COMMANDS)
+        {
             writeln!(out, "  {}: {}", command.description, command.command)
                 .expect("writing to string should succeed");
         }

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use regex::RegexBuilder;
 
@@ -221,7 +221,7 @@ fn collect_grep_matches_for_path(
     relative_path: &str,
     grep: &PreparedGrep,
 ) -> Option<Vec<GrepMatch>> {
-    let path = root.join(PathBuf::from(relative_path));
+    let path = scanner::join_safe_relative_path(root, relative_path)?;
     let content = fs::read_to_string(path).ok()?;
     let lines = content.lines().collect::<Vec<_>>();
 
@@ -442,7 +442,7 @@ mod tests {
     use crate::model::{FileSummary, GrepMode, GrepQuery, LocationSummary, SearchQuery, Tag};
     use crate::scanner::{self, ScanMode};
 
-    use super::{search_files, search_files_lazy};
+    use super::{PreparedGrep, collect_grep_matches_for_path, search_files, search_files_lazy};
 
     fn temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -747,6 +747,27 @@ mod tests {
 
         let result = search_files_lazy(&root, query).expect("lazy search should not error");
         assert!(result.is_none());
+
+        fs::remove_dir_all(root).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn grep_match_collection_rejects_unsafe_relative_paths() {
+        let root = temp_path("unsafe-grep-path");
+        fs::create_dir_all(&root).expect("should create temp dir");
+        let grep = PreparedGrep {
+            query: GrepQuery {
+                pattern: "hello".to_owned(),
+                mode: GrepMode::Literal,
+                case_sensitive: true,
+                context_before: 0,
+                context_after: 0,
+                max_matches_per_file: 1,
+            },
+            matcher: regex::Regex::new("hello").expect("regex should compile"),
+        };
+
+        assert!(collect_grep_matches_for_path(&root, "../outside", &grep).is_none());
 
         fs::remove_dir_all(root).expect("should clean up temp dir");
     }

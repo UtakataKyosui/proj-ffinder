@@ -11,7 +11,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use model::{GrepMode, GrepQuery, SearchQuery};
 use scanner::ScanMode;
 
@@ -46,104 +46,189 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    // Keep the old `proj-finder .` behavior by treating a lone positional
-    // argument as the repo root hint when no subcommand is provided.
+    /// Repository root hint. If omitted, the current directory is used and
+    /// `.git` is searched upward to find the repository root.
     #[arg(value_name = "ROOT")]
     root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Args)]
+struct SearchTagArgs {
+    /// Require files tagged with this language, for example `rust`.
+    #[arg(long, value_name = "LANG", action = ArgAction::Append)]
+    lang: Vec<String>,
+    /// Exclude files tagged with this language.
+    #[arg(long, value_name = "LANG", action = ArgAction::Append)]
+    exclude_lang: Vec<String>,
+    /// Require files tagged with this kind, for example `source` or `docs`.
+    #[arg(long, value_name = "KIND", action = ArgAction::Append)]
+    kind: Vec<String>,
+    /// Exclude files tagged with this kind.
+    #[arg(long, value_name = "KIND", action = ArgAction::Append)]
+    exclude_kind: Vec<String>,
+    /// Require files tagged with this role, for example `entrypoint` or `test`.
+    #[arg(long, value_name = "ROLE", action = ArgAction::Append)]
+    role: Vec<String>,
+    /// Exclude files tagged with this role.
+    #[arg(long, value_name = "ROLE", action = ArgAction::Append)]
+    exclude_role: Vec<String>,
+    /// Require files tagged with this technology, for example `react`.
+    #[arg(long, value_name = "TECH", action = ArgAction::Append)]
+    tech: Vec<String>,
+    /// Exclude files tagged with this technology.
+    #[arg(long, value_name = "TECH", action = ArgAction::Append)]
+    exclude_tech: Vec<String>,
+    /// Require files tagged with this extracted keyword.
+    #[arg(long, value_name = "KEYWORD", action = ArgAction::Append)]
+    keyword: Vec<String>,
+    /// Exclude files tagged with this extracted keyword.
+    #[arg(long, value_name = "KEYWORD", action = ArgAction::Append)]
+    exclude_keyword: Vec<String>,
+    /// Require this exact tag value, for example `lang:rust`.
+    #[arg(long, value_name = "TAG", action = ArgAction::Append)]
+    must: Vec<String>,
+    /// Require at least one of these exact tag values.
+    #[arg(long, value_name = "TAG", action = ArgAction::Append)]
+    any: Vec<String>,
+    /// Exclude files matching any of these exact tag values.
+    #[arg(long, value_name = "TAG", action = ArgAction::Append)]
+    exclude: Vec<String>,
+    /// Boost files matching these exact tag values.
+    #[arg(long, value_name = "TAG", action = ArgAction::Append)]
+    prefer: Vec<String>,
+}
+
+impl SearchTagArgs {
+    fn has_values(&self) -> bool {
+        !self.lang.is_empty()
+            || !self.exclude_lang.is_empty()
+            || !self.kind.is_empty()
+            || !self.exclude_kind.is_empty()
+            || !self.role.is_empty()
+            || !self.exclude_role.is_empty()
+            || !self.tech.is_empty()
+            || !self.exclude_tech.is_empty()
+            || !self.keyword.is_empty()
+            || !self.exclude_keyword.is_empty()
+            || !self.must.is_empty()
+            || !self.any.is_empty()
+            || !self.exclude.is_empty()
+            || !self.prefer.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct GrepOptionArgs {
+    /// Treat the grep pattern as a regular expression instead of a literal string.
+    #[arg(long)]
+    regex: bool,
+    /// Make grep matching case-sensitive.
+    #[arg(long)]
+    case_sensitive: bool,
+    /// Show this many lines before each grep match.
+    #[arg(long, default_value_t = 0)]
+    context_before: usize,
+    /// Show this many lines after each grep match.
+    #[arg(long, default_value_t = 0)]
+    context_after: usize,
+    /// Stop reading a file after this many grep matches were collected.
+    #[arg(long, default_value_t = 3)]
+    max_matches_per_file: usize,
+}
+
+impl GrepOptionArgs {
+    fn has_custom_values(&self) -> bool {
+        self.regex
+            || self.case_sensitive
+            || self.context_before > 0
+            || self.context_after > 0
+            || self.max_matches_per_file != 3
+    }
+}
+
+#[derive(Clone, Debug, Args)]
+struct SearchCliArgs {
+    /// Print JSON instead of human-friendly formatted output.
+    #[arg(long)]
+    json: bool,
+    /// Disable ANSI colors in formatted output.
+    #[arg(long)]
+    no_color: bool,
+    /// Choose how much information to show for each hit.
+    #[arg(long, value_enum, default_value_t = SearchDisplay::Summary)]
+    show: SearchDisplay,
+    /// Sort hits by score or by path before applying `--limit`.
+    #[arg(long, value_enum, default_value_t = SearchSort::Score)]
+    sort: SearchSort,
+    /// Control how much tag-match reasoning to display.
+    #[arg(long, value_enum, default_value_t = SearchReasonDisplay::Full)]
+    show_reason: SearchReasonDisplay,
+    /// Provide the full query as JSON instead of using structured flags.
+    #[arg(long, value_name = "JSON")]
+    query: Option<String>,
+    #[command(flatten)]
+    tags: SearchTagArgs,
+    /// Restrict matches to files whose contents match this pattern.
+    #[arg(long, value_name = "PATTERN")]
+    grep: Option<String>,
+    #[command(flatten)]
+    grep_options: GrepOptionArgs,
+    /// Maximum number of hits to print after sorting.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    /// Refresh the on-disk cache incrementally before searching.
+    #[arg(long)]
+    incremental: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+struct GrepCliArgs {
+    /// Print JSON instead of human-friendly formatted output.
+    #[arg(long)]
+    json: bool,
+    /// Disable ANSI colors in formatted output.
+    #[arg(long)]
+    no_color: bool,
+    #[command(flatten)]
+    grep_options: GrepOptionArgs,
+    /// Maximum number of files to print after sorting by score.
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+    /// Refresh the on-disk cache incrementally before searching.
+    #[arg(long)]
+    incremental: bool,
 }
 
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Command {
+    /// Scan the repository and emit file summaries as JSON.
     Scan {
+        /// Repository root hint. `.git` is searched upward from this path.
         #[arg(value_name = "ROOT")]
         root: Option<PathBuf>,
+        /// Refresh the on-disk cache incrementally when possible.
         #[arg(long)]
         incremental: bool,
     },
+    /// Search indexed files by tags and optional grep pattern.
     Search {
+        /// Repository root hint. `.git` is searched upward from this path.
         #[arg(value_name = "ROOT")]
         root: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        no_color: bool,
-        #[arg(long, value_enum, default_value_t = SearchDisplay::Summary)]
-        show: SearchDisplay,
-        #[arg(long, value_enum, default_value_t = SearchSort::Score)]
-        sort: SearchSort,
-        #[arg(long, value_enum, default_value_t = SearchReasonDisplay::Full)]
-        show_reason: SearchReasonDisplay,
-        #[arg(long, value_name = "JSON")]
-        query: Option<String>,
-        #[arg(long, value_name = "LANG", action = ArgAction::Append)]
-        lang: Vec<String>,
-        #[arg(long, value_name = "LANG", action = ArgAction::Append)]
-        exclude_lang: Vec<String>,
-        #[arg(long, value_name = "KIND", action = ArgAction::Append)]
-        kind: Vec<String>,
-        #[arg(long, value_name = "KIND", action = ArgAction::Append)]
-        exclude_kind: Vec<String>,
-        #[arg(long, value_name = "ROLE", action = ArgAction::Append)]
-        role: Vec<String>,
-        #[arg(long, value_name = "ROLE", action = ArgAction::Append)]
-        exclude_role: Vec<String>,
-        #[arg(long, value_name = "TECH", action = ArgAction::Append)]
-        tech: Vec<String>,
-        #[arg(long, value_name = "TECH", action = ArgAction::Append)]
-        exclude_tech: Vec<String>,
-        #[arg(long, value_name = "KEYWORD", action = ArgAction::Append)]
-        keyword: Vec<String>,
-        #[arg(long, value_name = "KEYWORD", action = ArgAction::Append)]
-        exclude_keyword: Vec<String>,
-        #[arg(long, value_name = "TAG", action = ArgAction::Append)]
-        must: Vec<String>,
-        #[arg(long, value_name = "TAG", action = ArgAction::Append)]
-        any: Vec<String>,
-        #[arg(long, value_name = "TAG", action = ArgAction::Append)]
-        exclude: Vec<String>,
-        #[arg(long, value_name = "TAG", action = ArgAction::Append)]
-        prefer: Vec<String>,
-        #[arg(long, value_name = "PATTERN")]
-        grep: Option<String>,
-        #[arg(long)]
-        regex: bool,
-        #[arg(long)]
-        case_sensitive: bool,
-        #[arg(long, default_value_t = 0)]
-        context_before: usize,
-        #[arg(long, default_value_t = 0)]
-        context_after: usize,
-        #[arg(long, default_value_t = 3)]
-        max_matches_per_file: usize,
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-        #[arg(long)]
-        incremental: bool,
+        #[command(flatten)]
+        args: SearchCliArgs,
     },
+    /// Search file contents like grep and print matching lines.
     Grep {
+        /// Literal text or regular expression to search for.
         #[arg(value_name = "PATTERN")]
         pattern: String,
+        /// Repository root hint. `.git` is searched upward from this path.
         #[arg(value_name = "ROOT")]
         root: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        no_color: bool,
-        #[arg(long)]
-        regex: bool,
-        #[arg(long)]
-        case_sensitive: bool,
-        #[arg(long, default_value_t = 0)]
-        context_before: usize,
-        #[arg(long, default_value_t = 0)]
-        context_after: usize,
-        #[arg(long, default_value_t = 3)]
-        max_matches_per_file: usize,
-        #[arg(long, default_value_t = 10)]
-        limit: usize,
-        #[arg(long)]
-        incremental: bool,
+        #[command(flatten)]
+        args: GrepCliArgs,
     },
 }
 
@@ -152,92 +237,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli.command {
         Some(Command::Scan { root, incremental }) => run_scan(root, incremental)?,
-        Some(Command::Search {
-            root,
-            json,
-            no_color,
-            show,
-            sort,
-            show_reason,
-            query,
-            lang,
-            exclude_lang,
-            kind,
-            exclude_kind,
-            role,
-            exclude_role,
-            tech,
-            exclude_tech,
-            keyword,
-            exclude_keyword,
-            must,
-            any,
-            exclude,
-            prefer,
-            grep,
-            regex,
-            case_sensitive,
-            context_before,
-            context_after,
-            max_matches_per_file,
-            limit,
-            incremental,
-        }) => run_search(
-            root,
-            json,
-            no_color,
-            show,
-            sort,
-            show_reason,
-            query,
-            lang,
-            exclude_lang,
-            kind,
-            exclude_kind,
-            role,
-            exclude_role,
-            tech,
-            exclude_tech,
-            keyword,
-            exclude_keyword,
-            must,
-            any,
-            exclude,
-            prefer,
-            grep,
-            regex,
-            case_sensitive,
-            context_before,
-            context_after,
-            max_matches_per_file,
-            limit,
-            incremental,
-        )?,
+        Some(Command::Search { root, args }) => run_search(root, &args)?,
         Some(Command::Grep {
             pattern,
             root,
-            json,
-            no_color,
-            regex,
-            case_sensitive,
-            context_before,
-            context_after,
-            max_matches_per_file,
-            limit,
-            incremental,
-        }) => run_grep(
-            root,
-            &pattern,
-            json,
-            no_color,
-            regex,
-            case_sensitive,
-            context_before,
-            context_after,
-            max_matches_per_file,
-            limit,
-            incremental,
-        )?,
+            args,
+        }) => run_grep(root, &pattern, &args)?,
         None => run_scan(cli.root, false)?,
     }
 
@@ -252,64 +257,10 @@ fn run_scan(root: Option<PathBuf>, incremental: bool) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_search(
-    root: Option<PathBuf>,
-    json: bool,
-    no_color: bool,
-    show: SearchDisplay,
-    sort: SearchSort,
-    show_reason: SearchReasonDisplay,
-    query_json: Option<String>,
-    lang: Vec<String>,
-    exclude_lang: Vec<String>,
-    kind: Vec<String>,
-    exclude_kind: Vec<String>,
-    role: Vec<String>,
-    exclude_role: Vec<String>,
-    tech: Vec<String>,
-    exclude_tech: Vec<String>,
-    keyword: Vec<String>,
-    exclude_keyword: Vec<String>,
-    must: Vec<String>,
-    any: Vec<String>,
-    exclude: Vec<String>,
-    prefer: Vec<String>,
-    grep: Option<String>,
-    regex: bool,
-    case_sensitive: bool,
-    context_before: usize,
-    context_after: usize,
-    max_matches_per_file: usize,
-    limit: usize,
-    incremental: bool,
-) -> Result<(), Box<dyn Error>> {
+fn run_search(root: Option<PathBuf>, args: &SearchCliArgs) -> Result<(), Box<dyn Error>> {
     let root = resolve_repo_root(root)?;
-    let query = build_search_query(
-        query_json,
-        lang,
-        exclude_lang,
-        kind,
-        exclude_kind,
-        role,
-        exclude_role,
-        tech,
-        exclude_tech,
-        keyword,
-        exclude_keyword,
-        must,
-        any,
-        exclude,
-        prefer,
-        grep,
-        regex,
-        case_sensitive,
-        context_before,
-        context_after,
-        max_matches_per_file,
-        limit,
-    )?;
-    let mut search_result = if incremental {
+    let query = build_search_query(args)?;
+    let mut search_result = if args.incremental {
         let root = scanner::prepare_project_with_mode(&root, ScanMode::Incremental)?;
         if let Some(search_result) = search::search_files_lazy(&root, query.clone())? {
             search_result
@@ -323,44 +274,40 @@ fn run_search(
         let scan_result = scan_result_for(&root, false)?;
         search::search_files(&scan_result.root, &scan_result.files, query)?
     };
-    finalize_search_result(&mut search_result, sort);
+    finalize_search_result(&mut search_result, args.sort);
 
-    if json {
+    if args.json {
         serde_json::to_writer_pretty(std::io::stdout(), &search_result)?;
     } else {
         print!(
             "{}",
-            formatter::format_search_result(&search_result, !no_color, show, show_reason)?
+            formatter::format_search_result(
+                &search_result,
+                !args.no_color,
+                args.show,
+                args.show_reason,
+            )?
         );
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_grep(
     root: Option<PathBuf>,
     pattern: &str,
-    json: bool,
-    no_color: bool,
-    regex: bool,
-    case_sensitive: bool,
-    context_before: usize,
-    context_after: usize,
-    max_matches_per_file: usize,
-    limit: usize,
-    incremental: bool,
+    args: &GrepCliArgs,
 ) -> Result<(), Box<dyn Error>> {
     let root = resolve_repo_root(root)?;
     let query = grep_search_query(
         pattern.to_owned(),
-        regex,
-        case_sensitive,
-        context_before,
-        context_after,
-        max_matches_per_file,
-        limit,
+        args.grep_options.regex,
+        args.grep_options.case_sensitive,
+        args.grep_options.context_before,
+        args.grep_options.context_after,
+        args.grep_options.max_matches_per_file,
+        args.limit,
     );
-    let mut search_result = if incremental {
+    let mut search_result = if args.incremental {
         let root = scanner::prepare_project_with_mode(&root, ScanMode::Incremental)?;
         if let Some(search_result) = search::search_files_lazy(&root, query.clone())? {
             search_result
@@ -376,12 +323,12 @@ fn run_grep(
     };
     finalize_search_result(&mut search_result, SearchSort::Score);
 
-    if json {
+    if args.json {
         serde_json::to_writer_pretty(std::io::stdout(), &search_result)?;
     } else {
         print!(
             "{}",
-            formatter::format_grep_result(&search_result, !no_color)?
+            formatter::format_grep_result(&search_result, !args.no_color)?
         );
     }
     Ok(())
@@ -416,120 +363,62 @@ fn scan_result_for(root: &Path, incremental: bool) -> Result<model::ScanResult, 
     Ok(scanner::scan_project_with_mode(root, mode)?)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_search_query(
-    query_json: Option<String>,
-    lang: Vec<String>,
-    exclude_lang: Vec<String>,
-    kind: Vec<String>,
-    exclude_kind: Vec<String>,
-    role: Vec<String>,
-    exclude_role: Vec<String>,
-    tech: Vec<String>,
-    exclude_tech: Vec<String>,
-    keyword: Vec<String>,
-    exclude_keyword: Vec<String>,
-    must: Vec<String>,
-    any: Vec<String>,
-    exclude: Vec<String>,
-    prefer: Vec<String>,
-    grep: Option<String>,
-    regex: bool,
-    case_sensitive: bool,
-    context_before: usize,
-    context_after: usize,
-    max_matches_per_file: usize,
-    limit: usize,
-) -> Result<SearchQuery, Box<dyn Error>> {
-    let has_structured_args = !lang.is_empty()
-        || !exclude_lang.is_empty()
-        || !kind.is_empty()
-        || !exclude_kind.is_empty()
-        || !role.is_empty()
-        || !exclude_role.is_empty()
-        || !tech.is_empty()
-        || !exclude_tech.is_empty()
-        || !keyword.is_empty()
-        || !exclude_keyword.is_empty()
-        || !must.is_empty()
-        || !any.is_empty()
-        || !exclude.is_empty()
-        || !prefer.is_empty()
-        || grep.is_some()
-        || regex
-        || case_sensitive
-        || context_before > 0
-        || context_after > 0
-        || max_matches_per_file != 3
-        || limit != 10;
+// Build a structured search query from the human-friendly CLI flags while
+// preserving the older `--query <json>` escape hatch.
+fn build_search_query(args: &SearchCliArgs) -> Result<SearchQuery, Box<dyn Error>> {
+    let has_structured_args = args.tags.has_values()
+        || args.grep.is_some()
+        || args.grep_options.has_custom_values()
+        || args.limit != 10;
 
-    if let Some(query_json) = query_json {
+    if let Some(query_json) = args.query.as_deref() {
         if has_structured_args {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--query cannot be combined with --must/--any/--exclude/--prefer/--grep or grep options",
+                "--query cannot be combined with structured search flags (such as --lang/--kind/--role/--tech/--keyword and their --exclude-* variants, --must/--any/--exclude/--prefer, --grep and grep context/max-match options, or --limit)",
             )
             .into());
         }
-        return Ok(serde_json::from_str::<SearchQuery>(&query_json)?);
+        return Ok(serde_json::from_str::<SearchQuery>(query_json)?);
     }
 
     let must = unique_tag_values(
-        lang.into_iter()
-            .map(|value| format!("lang:{value}"))
-            .chain(kind.into_iter().map(|value| format!("kind:{value}")))
-            .chain(role.into_iter().map(|value| format!("role:{value}")))
-            .chain(tech.into_iter().map(|value| format!("tech:{value}")))
-            .chain(keyword.into_iter().map(|value| format!("kw:{value}")))
-            .chain(must)
+        prefix_tags(&args.tags.lang, "lang")
+            .chain(prefix_tags(&args.tags.kind, "kind"))
+            .chain(prefix_tags(&args.tags.role, "role"))
+            .chain(prefix_tags(&args.tags.tech, "tech"))
+            .chain(prefix_tags(&args.tags.keyword, "kw"))
+            .chain(args.tags.must.iter().cloned())
             .collect::<Vec<_>>(),
     );
     let exclude = unique_tag_values(
-        exclude_lang
-            .into_iter()
-            .map(|value| format!("lang:{value}"))
-            .chain(
-                exclude_kind
-                    .into_iter()
-                    .map(|value| format!("kind:{value}")),
-            )
-            .chain(
-                exclude_role
-                    .into_iter()
-                    .map(|value| format!("role:{value}")),
-            )
-            .chain(
-                exclude_tech
-                    .into_iter()
-                    .map(|value| format!("tech:{value}")),
-            )
-            .chain(
-                exclude_keyword
-                    .into_iter()
-                    .map(|value| format!("kw:{value}")),
-            )
-            .chain(exclude)
+        prefix_tags(&args.tags.exclude_lang, "lang")
+            .chain(prefix_tags(&args.tags.exclude_kind, "kind"))
+            .chain(prefix_tags(&args.tags.exclude_role, "role"))
+            .chain(prefix_tags(&args.tags.exclude_tech, "tech"))
+            .chain(prefix_tags(&args.tags.exclude_keyword, "kw"))
+            .chain(args.tags.exclude.iter().cloned())
             .collect::<Vec<_>>(),
     );
 
     Ok(SearchQuery {
         must,
-        any,
+        any: args.tags.any.clone(),
         exclude,
-        prefer,
-        grep: grep.map(|pattern| GrepQuery {
+        prefer: args.tags.prefer.clone(),
+        grep: args.grep.clone().map(|pattern| GrepQuery {
             pattern,
-            mode: if regex {
+            mode: if args.grep_options.regex {
                 GrepMode::Regex
             } else {
                 GrepMode::Literal
             },
-            case_sensitive,
-            context_before,
-            context_after,
-            max_matches_per_file,
+            case_sensitive: args.grep_options.case_sensitive,
+            context_before: args.grep_options.context_before,
+            context_after: args.grep_options.context_after,
+            max_matches_per_file: args.grep_options.max_matches_per_file,
         }),
-        limit,
+        limit: args.limit,
     })
 }
 
@@ -539,6 +428,12 @@ fn unique_tag_values(values: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|value| seen.insert(value.clone()))
         .collect()
+}
+
+// Expand shorthand flags such as `--lang rust` into exact tag values like
+// `lang:rust` so the search engine only needs to reason about tags.
+fn prefix_tags<'a>(values: &'a [String], prefix: &'a str) -> impl Iterator<Item = String> + 'a {
+    values.iter().map(move |value| format!("{prefix}:{value}"))
 }
 
 fn grep_search_query(
@@ -603,8 +498,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, Command, SearchDisplay, SearchReasonDisplay, SearchSort, build_search_query,
-        find_repo_root,
+        Cli, Command, GrepOptionArgs, SearchCliArgs, SearchDisplay, SearchReasonDisplay,
+        SearchSort, SearchTagArgs, build_search_query, find_repo_root,
     };
     use crate::model::GrepMode;
     use std::fs;
@@ -666,27 +561,19 @@ mod tests {
             Some(Command::Grep {
                 pattern,
                 root,
-                json,
-                no_color,
-                regex,
-                case_sensitive,
-                context_before,
-                context_after,
-                max_matches_per_file,
-                limit,
-                incremental,
+                args,
             }) => {
                 assert_eq!(pattern, "ScanMode");
                 assert_eq!(root, Some(PathBuf::from(".")));
-                assert!(!json);
-                assert!(!no_color);
-                assert!(regex);
-                assert!(!case_sensitive);
-                assert_eq!(context_before, 1);
-                assert_eq!(context_after, 2);
-                assert_eq!(max_matches_per_file, 5);
-                assert_eq!(limit, 7);
-                assert!(incremental);
+                assert!(!args.json);
+                assert!(!args.no_color);
+                assert!(args.grep_options.regex);
+                assert!(!args.grep_options.case_sensitive);
+                assert_eq!(args.grep_options.context_before, 1);
+                assert_eq!(args.grep_options.context_after, 2);
+                assert_eq!(args.grep_options.max_matches_per_file, 5);
+                assert_eq!(args.limit, 7);
+                assert!(args.incremental);
             }
             other => panic!("expected grep command, got {other:?}"),
         }
@@ -748,66 +635,36 @@ mod tests {
         ]);
 
         match cli.command {
-            Some(Command::Search {
-                root,
-                json,
-                no_color,
-                show,
-                sort,
-                show_reason,
-                query,
-                lang,
-                exclude_lang,
-                kind,
-                exclude_kind,
-                role,
-                exclude_role,
-                tech,
-                exclude_tech,
-                keyword,
-                exclude_keyword,
-                must,
-                any,
-                exclude,
-                prefer,
-                grep,
-                regex,
-                case_sensitive,
-                context_before,
-                context_after,
-                max_matches_per_file,
-                limit,
-                incremental,
-            }) => {
+            Some(Command::Search { root, args }) => {
                 assert_eq!(root, Some(PathBuf::from(".")));
-                assert!(!json);
-                assert!(!no_color);
-                assert_eq!(show, SearchDisplay::Full);
-                assert_eq!(sort, SearchSort::Path);
-                assert_eq!(show_reason, SearchReasonDisplay::Brief);
-                assert!(query.is_none());
-                assert_eq!(lang, vec!["rust"]);
-                assert!(exclude_lang.is_empty());
-                assert_eq!(kind, vec!["source"]);
-                assert_eq!(exclude_kind, vec!["generated"]);
-                assert_eq!(role, vec!["entrypoint"]);
-                assert_eq!(exclude_role, vec!["test"]);
-                assert_eq!(tech, vec!["rust"]);
-                assert_eq!(exclude_tech, vec!["legacy"]);
-                assert_eq!(keyword, vec!["auth"]);
-                assert_eq!(exclude_keyword, vec!["generated"]);
-                assert_eq!(must, vec!["lang:rust", "role:entrypoint"]);
-                assert_eq!(any, vec!["kw:auth"]);
-                assert_eq!(exclude, vec!["kind:generated"]);
-                assert_eq!(prefer, vec!["dir:src"]);
-                assert_eq!(grep, Some("main".to_owned()));
-                assert!(regex);
-                assert!(case_sensitive);
-                assert_eq!(context_before, 1);
-                assert_eq!(context_after, 2);
-                assert_eq!(max_matches_per_file, 4);
-                assert_eq!(limit, 8);
-                assert!(incremental);
+                assert!(!args.json);
+                assert!(!args.no_color);
+                assert_eq!(args.show, SearchDisplay::Full);
+                assert_eq!(args.sort, SearchSort::Path);
+                assert_eq!(args.show_reason, SearchReasonDisplay::Brief);
+                assert!(args.query.is_none());
+                assert_eq!(args.tags.lang, vec!["rust"]);
+                assert!(args.tags.exclude_lang.is_empty());
+                assert_eq!(args.tags.kind, vec!["source"]);
+                assert_eq!(args.tags.exclude_kind, vec!["generated"]);
+                assert_eq!(args.tags.role, vec!["entrypoint"]);
+                assert_eq!(args.tags.exclude_role, vec!["test"]);
+                assert_eq!(args.tags.tech, vec!["rust"]);
+                assert_eq!(args.tags.exclude_tech, vec!["legacy"]);
+                assert_eq!(args.tags.keyword, vec!["auth"]);
+                assert_eq!(args.tags.exclude_keyword, vec!["generated"]);
+                assert_eq!(args.tags.must, vec!["lang:rust", "role:entrypoint"]);
+                assert_eq!(args.tags.any, vec!["kw:auth"]);
+                assert_eq!(args.tags.exclude, vec!["kind:generated"]);
+                assert_eq!(args.tags.prefer, vec!["dir:src"]);
+                assert_eq!(args.grep, Some("main".to_owned()));
+                assert!(args.grep_options.regex);
+                assert!(args.grep_options.case_sensitive);
+                assert_eq!(args.grep_options.context_before, 1);
+                assert_eq!(args.grep_options.context_after, 2);
+                assert_eq!(args.grep_options.max_matches_per_file, 4);
+                assert_eq!(args.limit, 8);
+                assert!(args.incremental);
             }
             other => panic!("expected search command, got {other:?}"),
         }
@@ -815,30 +672,40 @@ mod tests {
 
     #[test]
     fn builds_search_query_from_human_friendly_flags() {
-        let query = build_search_query(
-            None,
-            vec!["rust".to_owned()],
-            vec!["markdown".to_owned()],
-            vec!["source".to_owned()],
-            vec!["generated".to_owned()],
-            vec!["entrypoint".to_owned()],
-            vec!["test".to_owned()],
-            vec!["rust".to_owned()],
-            vec!["legacy".to_owned()],
-            vec!["auth".to_owned()],
-            vec!["generated".to_owned()],
-            vec!["lang:rust".to_owned()],
-            vec!["kw:auth".to_owned()],
-            vec!["kind:generated".to_owned()],
-            vec!["dir:src".to_owned()],
-            Some("main".to_owned()),
-            true,
-            true,
-            1,
-            2,
-            4,
-            8,
-        )
+        let query = build_search_query(&SearchCliArgs {
+            json: false,
+            no_color: false,
+            show: SearchDisplay::Summary,
+            sort: SearchSort::Score,
+            show_reason: SearchReasonDisplay::Full,
+            query: None,
+            tags: SearchTagArgs {
+                lang: vec!["rust".to_owned()],
+                exclude_lang: vec!["markdown".to_owned()],
+                kind: vec!["source".to_owned()],
+                exclude_kind: vec!["generated".to_owned()],
+                role: vec!["entrypoint".to_owned()],
+                exclude_role: vec!["test".to_owned()],
+                tech: vec!["rust".to_owned()],
+                exclude_tech: vec!["legacy".to_owned()],
+                keyword: vec!["auth".to_owned()],
+                exclude_keyword: vec!["generated".to_owned()],
+                must: vec!["lang:rust".to_owned()],
+                any: vec!["kw:auth".to_owned()],
+                exclude: vec!["kind:generated".to_owned()],
+                prefer: vec!["dir:src".to_owned()],
+            },
+            grep: Some("main".to_owned()),
+            grep_options: GrepOptionArgs {
+                regex: true,
+                case_sensitive: true,
+                context_before: 1,
+                context_after: 2,
+                max_matches_per_file: 4,
+            },
+            limit: 8,
+            incremental: false,
+        })
         .expect("human-friendly search query should build");
 
         assert_eq!(
@@ -879,32 +746,42 @@ mod tests {
 
     #[test]
     fn rejects_mixing_json_query_with_human_friendly_flags() {
-        let error = build_search_query(
-            Some("{\"must\":[\"lang:rust\"]}".to_owned()),
-            vec!["rust".to_owned()],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec!["role:entrypoint".to_owned()],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            false,
-            false,
-            0,
-            0,
-            3,
-            10,
-        )
+        let error = build_search_query(&SearchCliArgs {
+            json: false,
+            no_color: false,
+            show: SearchDisplay::Summary,
+            sort: SearchSort::Score,
+            show_reason: SearchReasonDisplay::Full,
+            query: Some("{\"must\":[\"lang:rust\"]}".to_owned()),
+            tags: SearchTagArgs {
+                lang: vec!["rust".to_owned()],
+                exclude_lang: vec![],
+                kind: vec![],
+                exclude_kind: vec![],
+                role: vec![],
+                exclude_role: vec![],
+                tech: vec![],
+                exclude_tech: vec![],
+                keyword: vec![],
+                exclude_keyword: vec![],
+                must: vec!["role:entrypoint".to_owned()],
+                any: vec![],
+                exclude: vec![],
+                prefer: vec![],
+            },
+            grep: None,
+            grep_options: GrepOptionArgs {
+                regex: false,
+                case_sensitive: false,
+                context_before: 0,
+                context_after: 0,
+                max_matches_per_file: 3,
+            },
+            limit: 10,
+            incremental: false,
+        })
         .expect_err("mixed query styles should fail");
 
-        assert!(error.to_string().contains("--query cannot be combined"));
+        assert!(error.to_string().contains("structured search flags"));
     }
 }
