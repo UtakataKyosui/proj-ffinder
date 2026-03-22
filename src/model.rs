@@ -56,7 +56,7 @@ pub struct ContentMetrics {
     pub comment_line_count: usize,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct SearchQuery {
     #[serde(default)]
     pub must: Vec<String>,
@@ -66,6 +66,8 @@ pub struct SearchQuery {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub prefer: Vec<String>,
+    #[serde(default)]
+    pub grep: Option<GrepQuery>,
     #[serde(default = "default_limit")]
     pub limit: usize,
 }
@@ -75,6 +77,7 @@ pub struct SearchResult {
     pub root: String,
     pub query: SearchQuery,
     pub hits: Vec<SearchHit>,
+    pub assistance: SearchAssistance,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +93,26 @@ pub struct SearchHit {
     pub matched_any_details: Vec<MatchedTag>,
     pub matched_prefer: Vec<String>,
     pub matched_prefer_details: Vec<MatchedTag>,
+    pub grep_matches: Vec<GrepMatch>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchAssistance {
+    pub suggested_tags: Vec<SuggestedTag>,
+    pub suggested_commands: Vec<SuggestedCommand>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuggestedTag {
+    pub value: String,
+    pub hit_count: usize,
+    pub sample_paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuggestedCommand {
+    pub description: String,
+    pub command: String,
 }
 
 fn default_limit() -> usize {
@@ -102,4 +125,45 @@ pub struct MatchedTag {
     pub source: String,
     pub confidence: f32,
     pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GrepQuery {
+    pub pattern: String,
+    #[serde(default)]
+    pub mode: GrepMode,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub context_before: usize,
+    #[serde(default)]
+    pub context_after: usize,
+    #[serde(default = "default_grep_matches_per_file")]
+    pub max_matches_per_file: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrepMode {
+    #[default]
+    Literal,
+    Regex,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GrepMatch {
+    pub line_number: usize,
+    pub line: String,
+    pub before: Vec<GrepContextLine>,
+    pub after: Vec<GrepContextLine>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GrepContextLine {
+    pub line_number: usize,
+    pub line: String,
+}
+
+fn default_grep_matches_per_file() -> usize {
+    3
 }

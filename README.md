@@ -623,13 +623,17 @@ AST ベースで拾うため、
 
 差分更新を使う場合は、
 リポジトリルート配下の
-`.proj-finder/files.bin`
+`.proj-finder/manifest.bin`
 と
-`.proj-finder/tags.bin`
+`.proj-finder/shards/`
 へ要約キャッシュを保存する。
 
-`files.bin` にはファイル要約本体を、
-`tags.bin` にはタグ辞書と inverted index を持たせる。
+`manifest.bin` には
+version / root / git head / path / hash の一覧を持たせ、
+各ファイルの要約本体は
+`.proj-finder/shards/<relative-path>.bin`
+へ shard 単位で保存する。
+これにより、差分更新時は changed file の shard だけを書き換えられる。
 CLI 出力用 JSON とは分離し、
 内部保存は軽量バイナリ形式で扱う。
 
@@ -664,20 +668,84 @@ cargo run -- scan . --incremental
 
 ### 検索の使い方
 
-検索は、構造化クエリを JSON で渡す。
+検索は、人間向けのフラグ指定か、構造化クエリ JSON のどちらかで渡す。
+既定では人間向けの整形出力を返し、JSON が必要な場合は `--json` を付ける。
+整形出力の量は `--show path|summary|full` で切り替えられる。
+結果の並び順は `--sort score|path`、
+理由表示の密度は `--show-reason none|brief|full` で切り替えられる。
+よく使う条件には `--lang`, `--exclude-lang`, `--kind`, `--exclude-kind`
+のほか、
+`--role`, `--exclude-role`, `--tech`, `--exclude-tech`,
+`--keyword`, `--exclude-keyword`
+のショートハンドも使える。
+
+```bash
+cargo run -- search . --must role:docs --prefer ext:md --limit 5
+```
+
+`--show path` は path だけを出し、
+`--show summary` は path / score / type / 理由を出し、
+`--show full` はそれに `grep` の該当行と前後コンテキストも含める。
+`summary` と `full` では、検索結果の末尾に
+追加探索に使える `suggest` と `try` も出す。
+`--show-reason none` は理由行を隠し、
+`--show-reason brief` はタグ値だけを出し、
+`--show-reason full` は source / confidence / evidence まで出す。
+
+複数条件は同じフラグを繰り返して指定できる。
+
+```bash
+cargo run -- search . \
+  --lang rust \
+  --kind source \
+  --role entrypoint \
+  --tech rust \
+  --keyword auth \
+  --exclude-kind generated \
+  --exclude-role test \
+  --prefer dir:src \
+  --limit 10
+```
+
+本文条件も同じ `search` サブコマンドで足せる。
+
+```bash
+cargo run -- search . \
+  --must lang:rust \
+  --grep 'println!' \
+  --show full \
+  --show-reason brief \
+  --context-before 1 \
+  --context-after 1 \
+  --limit 5
+```
+
+JSON で直接渡したい場合は、従来どおり `--query` も使える。
 
 ```bash
 cargo run -- search . --query '{"must":["role:docs"],"prefer":["ext:md"],"limit":5}'
 ```
 
+色を消したい場合は `--no-color` を付ける。
+パス順で見たい場合は `--sort path` を付ける。
+JSON 出力では、同じ補助情報が `assistance.suggested_tags` と
+`assistance.suggested_commands` に入る。
+
 差分更新済み index を使いながら検索したい場合は、
 次のように `--incremental` を付ける。
 
 ```bash
-cargo run -- search . --incremental --query '{"must":["role:docs"],"prefer":["ext:md"],"limit":5}'
+cargo run -- search . --incremental --must role:docs --prefer ext:md --limit 5
 ```
 
-クエリの形式:
+`--incremental` 時は、まず `.proj-finder/` の cache を差分更新する。
+そのうえで grep-only の検索
+(`must` / `any` / `exclude` / `prefer` を使わず、`grep` だけを使う検索)
+では、manifest の path 一覧を先に読み、
+本文にヒットしたファイルの shard だけを遅延読込する。
+タグ条件つきの検索は、現状では cache 更新後に通常の検索へ fallback する。
+
+フラグ指定は内部的に次の構造化クエリへ変換される。
 
 ```json
 {
@@ -685,6 +753,14 @@ cargo run -- search . --incremental --query '{"must":["role:docs"],"prefer":["ex
   "any": ["kw:auth", "kw:login"],
   "exclude": ["kind:generated", "kind:vendor"],
   "prefer": ["dir:src", "tech:http"],
+  "grep": {
+    "pattern": "println!",
+    "mode": "literal",
+    "case_sensitive": true,
+    "context_before": 1,
+    "context_after": 1,
+    "max_matches_per_file": 3
+  },
   "limit": 10
 }
 ```
@@ -695,6 +771,7 @@ cargo run -- search . --incremental --query '{"must":["role:docs"],"prefer":["ex
 - `matched_must`
 - `matched_any`
 - `matched_prefer`
+- `grep_matches`
 
 が含まれる。
 
@@ -702,6 +779,45 @@ cargo run -- search . --incremental --query '{"must":["role:docs"],"prefer":["ex
 現在は `role:*`, `dir:*`, `ext:*` に加えて、
 `kw:*`, `tech:*`, `side-effect:*`, `import:*`, `export:*`, `symbol:*`
 でも検索できる。
+さらに `grep` を指定すると、
+ファイル本文に対して `literal` または `regex` で行単位のマッチを取り、
+行番号と前後コンテキスト付きで返す。
+
+JSON とフラグ指定は同時には使わない。
+
+例:
+
+```bash
+cargo run -- search . --query '{"must":["lang:rust"],"grep":{"pattern":"println!","mode":"literal","case_sensitive":true,"context_before":1,"context_after":1,"max_matches_per_file":3},"limit":5}'
+```
+
+整形出力では、`path`, `score`, `type`, 一致したタグの理由、
+必要なら `grep` の該当行と前後コンテキストをまとめて表示する。
+
+### grep の使い方
+
+本文検索だけをしたい場合は、
+`grep` サブコマンドを使う。
+
+```bash
+cargo run -- grep 'println!' .
+```
+
+正規表現で検索したい場合は、
+`--regex` を付ける。
+
+```bash
+cargo run -- grep 'load[a-z]+' . --regex --context-before 1 --context-after 1
+```
+
+`grep` は内部的には `search` の本文検索機能を使うが、
+CLI としては JSON クエリを組まずに使える。
+既定では人間向けの整形出力を返し、
+マッチ箇所は ANSI カラーでハイライトする。
+JSON が必要な場合は `--json` を付ける。
+色を消したい場合は `--no-color` を付ける。
+`--incremental` を付けた grep は、
+manifest / shard cache を使う lazy load 経路を優先する。
 
 ### CI / Release
 

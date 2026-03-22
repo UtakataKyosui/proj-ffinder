@@ -1,4 +1,3 @@
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -15,11 +14,13 @@ use crate::polyglot_ast::analyze_other_file;
 use crate::rust_ast::analyze_rust_file;
 
 const INDEX_DIR: &str = ".proj-finder";
-const FILES_INDEX_FILE: &str = "files.bin";
-const TAGS_INDEX_FILE: &str = "tags.bin";
+const MANIFEST_FILE: &str = "manifest.bin";
+const SHARDS_DIR: &str = "shards";
+const LEGACY_FILES_INDEX_FILE: &str = "files.bin";
+const LEGACY_TAGS_INDEX_FILE: &str = "tags.bin";
 const LEGACY_COMBINED_INDEX_FILE: &str = "index.bin";
 const LEGACY_JSON_INDEX_FILE: &str = "index.json";
-const INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ScanMode {
@@ -28,10 +29,11 @@ pub enum ScanMode {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct PersistedFilesIndex {
+struct PersistedManifest {
     version: u32,
     root: String,
-    files: Vec<PersistedFileSummary>,
+    git_head: Option<String>,
+    files: Vec<PersistedManifestEntry>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -45,46 +47,14 @@ struct CachedFileSummary {
 struct PersistedIndex {
     version: u32,
     root: String,
+    git_head: Option<String>,
     files: Vec<CachedFileSummary>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct PersistedTagsIndex {
-    version: u32,
-    root: String,
-    strings: Vec<String>,
-    file_tags: Vec<Vec<CompactTag>>,
-    inverted_index: Vec<CompactPosting>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct PersistedFileSummary {
+struct PersistedManifestEntry {
     path: String,
     hash: String,
-    language: Option<String>,
-    kind: String,
-    location_summary: LocationSummary,
-    content_summary: Option<ContentSummary>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct CompactTag {
-    value_id: u32,
-    source_id: u32,
-    confidence: f32,
-    evidence_ids: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct CompactPosting {
-    value_id: u32,
-    file_indices: Vec<u32>,
-}
-
-#[derive(Debug, Default)]
-struct StringTableBuilder {
-    strings: Vec<String>,
-    ids: HashMap<String, u32>,
 }
 
 pub fn scan_project_with_mode(root: &Path, mode: ScanMode) -> io::Result<ScanResult> {
@@ -95,6 +65,29 @@ pub fn scan_project_with_mode(root: &Path, mode: ScanMode) -> io::Result<ScanRes
     }
 }
 
+pub fn prepare_project_with_mode(root: &Path, mode: ScanMode) -> io::Result<PathBuf> {
+    let root = root.canonicalize()?;
+    match mode {
+        ScanMode::Full => {
+            full_scan_persist_only(&root)?;
+        }
+        ScanMode::Incremental => {
+            incremental_refresh_only(&root)?;
+        }
+    }
+
+    Ok(root)
+}
+
+pub fn load_scan_result(root: &Path) -> io::Result<Option<ScanResult>> {
+    let root = root.canonicalize()?;
+    let Some(index) = load_index(&root)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(scan_result_from_cached_files(&root, index.files)))
+}
+
 fn full_scan(root: &Path) -> io::Result<ScanResult> {
     let mut file_paths = collect_scannable_files(root)?;
     file_paths.sort();
@@ -103,7 +96,11 @@ fn full_scan(root: &Path) -> io::Result<ScanResult> {
         .into_iter()
         .map(|path| cached_summary_for_path(root, &path))
         .collect::<io::Result<Vec<_>>>()?;
-    persist_index(root, &cached_files)?;
+    persist_index(
+        root,
+        current_git_head(root).ok().flatten().as_deref(),
+        &cached_files,
+    )?;
 
     Ok(ScanResult {
         root: root.display().to_string(),
@@ -114,6 +111,23 @@ fn full_scan(root: &Path) -> io::Result<ScanResult> {
     })
 }
 
+fn full_scan_persist_only(root: &Path) -> io::Result<()> {
+    let mut file_paths = collect_scannable_files(root)?;
+    file_paths.sort();
+
+    let cached_files = file_paths
+        .into_iter()
+        .map(|path| cached_summary_for_path(root, &path))
+        .collect::<io::Result<Vec<_>>>()?;
+    persist_index(
+        root,
+        current_git_head(root).ok().flatten().as_deref(),
+        &cached_files,
+    )?;
+
+    Ok(())
+}
+
 fn incremental_scan(root: &Path) -> io::Result<ScanResult> {
     let Some(index) = load_index(root)? else {
         return full_scan(root);
@@ -122,6 +136,62 @@ fn incremental_scan(root: &Path) -> io::Result<ScanResult> {
         return full_scan(root);
     }
 
+    let current_git_head = current_git_head(root).ok().flatten();
+    let cached_map = index
+        .files
+        .into_iter()
+        .map(|cached| (cached.path.clone(), cached))
+        .collect::<HashMap<_, _>>();
+
+    let changed_paths = match collect_git_changed_paths(
+        root,
+        index.git_head.as_deref(),
+        current_git_head.as_deref(),
+    ) {
+        Ok(changed) if !contains_gitignore_change(&changed) => changed,
+        _ => {
+            return incremental_scan_with_hash_fallback(
+                root,
+                cached_map,
+                current_git_head.as_deref(),
+            );
+        }
+    };
+
+    if changed_paths.is_empty() {
+        return scan_result_from_cached_map(root, cached_map);
+    }
+
+    let mut next_map = cached_map;
+    let mut ordered_changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+    ordered_changed_paths.sort();
+
+    for path in ordered_changed_paths {
+        let absolute_path = root.join(&path);
+        if absolute_path.is_file() {
+            next_map.insert(path, cached_summary_for_path(root, &absolute_path)?);
+        } else {
+            next_map.remove(&path);
+        }
+    }
+
+    let cached_files = sorted_cached_files(next_map);
+    persist_index(root, current_git_head.as_deref(), &cached_files)?;
+
+    Ok(ScanResult {
+        root: root.display().to_string(),
+        files: cached_files
+            .into_iter()
+            .map(|cached| cached.summary)
+            .collect(),
+    })
+}
+
+fn incremental_scan_with_hash_fallback(
+    root: &Path,
+    cached_map: HashMap<String, CachedFileSummary>,
+    current_git_head: Option<&str>,
+) -> io::Result<ScanResult> {
     let mut current_paths = collect_scannable_files(root)?;
     current_paths.sort();
     let current_map = current_paths
@@ -134,16 +204,13 @@ fn incremental_scan(root: &Path) -> io::Result<ScanResult> {
         })
         .collect::<HashMap<_, _>>();
 
-    let cached_map = index
-        .files
-        .into_iter()
-        .map(|cached| (cached.path.clone(), cached))
-        .collect::<HashMap<_, _>>();
-
-    let changed_paths = match collect_git_changed_paths(root) {
-        Ok(changed) if !contains_gitignore_change(&changed) => changed,
-        _ => collect_changed_paths_by_hash(&current_map, &cached_map)?,
-    };
+    let changed_paths = collect_changed_paths_by_hash(&current_map, &cached_map)?;
+    if changed_paths.is_empty()
+        && current_map.len() == cached_map.len()
+        && current_map.keys().all(|path| cached_map.contains_key(path))
+    {
+        return scan_result_from_cached_map(root, cached_map);
+    }
 
     let mut ordered_paths = current_map.keys().cloned().collect::<Vec<_>>();
     ordered_paths.sort();
@@ -163,7 +230,7 @@ fn incremental_scan(root: &Path) -> io::Result<ScanResult> {
         cached_files.push(cached_summary_for_path(root, absolute_path)?);
     }
 
-    persist_index(root, &cached_files)?;
+    persist_index(root, current_git_head, &cached_files)?;
 
     Ok(ScanResult {
         root: root.display().to_string(),
@@ -172,6 +239,131 @@ fn incremental_scan(root: &Path) -> io::Result<ScanResult> {
             .map(|cached| cached.summary)
             .collect::<Vec<_>>(),
     })
+}
+
+fn scan_result_from_cached_map(
+    root: &Path,
+    cached_map: HashMap<String, CachedFileSummary>,
+) -> io::Result<ScanResult> {
+    let cached_files = sorted_cached_files(cached_map);
+
+    Ok(scan_result_from_cached_files(root, cached_files))
+}
+
+fn scan_result_from_cached_files(root: &Path, cached_files: Vec<CachedFileSummary>) -> ScanResult {
+    ScanResult {
+        root: root.display().to_string(),
+        files: cached_files
+            .into_iter()
+            .map(|cached| cached.summary)
+            .collect(),
+    }
+}
+
+fn incremental_refresh_only(root: &Path) -> io::Result<()> {
+    let Some(manifest) = load_manifest(root)? else {
+        return full_scan_persist_only(root);
+    };
+    if manifest.version != INDEX_VERSION || manifest.root != root.display().to_string() {
+        return full_scan_persist_only(root);
+    }
+
+    let current_git_head = current_git_head(root).ok().flatten();
+    let changed_paths = match collect_git_changed_paths(
+        root,
+        manifest.git_head.as_deref(),
+        current_git_head.as_deref(),
+    ) {
+        Ok(changed) if !contains_gitignore_change(&changed) => changed,
+        _ => {
+            return incremental_refresh_with_hash_fallback(
+                root,
+                manifest,
+                current_git_head.as_deref(),
+            );
+        }
+    };
+
+    if changed_paths.is_empty() {
+        return Ok(());
+    }
+
+    let (updated_files, removed_paths) = collect_changed_cached_files(root, changed_paths)?;
+    persist_index_delta(
+        root,
+        current_git_head.as_deref(),
+        &manifest,
+        updated_files,
+        removed_paths,
+    )
+}
+
+fn incremental_refresh_with_hash_fallback(
+    root: &Path,
+    manifest: PersistedManifest,
+    current_git_head: Option<&str>,
+) -> io::Result<()> {
+    let mut current_paths = collect_scannable_files(root)?;
+    current_paths.sort();
+    let current_map = current_paths
+        .into_iter()
+        .map(|absolute_path| {
+            let relative = absolute_path
+                .strip_prefix(root)
+                .expect("scanned file should stay under root");
+            (normalize_path(relative), absolute_path)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let previous_hashes = manifest
+        .files
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.hash.as_str()))
+        .collect::<HashMap<_, _>>();
+    let changed_paths = collect_changed_paths_by_manifest_hash(&current_map, &previous_hashes)?;
+    let previous_paths = manifest
+        .files
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<HashSet<_>>();
+
+    if changed_paths.is_empty()
+        && current_map.len() == previous_paths.len()
+        && current_map
+            .keys()
+            .all(|path| previous_paths.contains(path.as_str()))
+    {
+        return Ok(());
+    }
+
+    let removed_paths = previous_paths
+        .into_iter()
+        .filter(|path| !current_map.contains_key(*path))
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+
+    let mut updated_files = HashMap::new();
+    for path in changed_paths {
+        let Some(absolute_path) = current_map.get(&path) else {
+            continue;
+        };
+        let cached = cached_summary_for_path(root, absolute_path)?;
+        updated_files.insert(path, cached);
+    }
+
+    persist_index_delta(
+        root,
+        current_git_head,
+        &manifest,
+        updated_files,
+        removed_paths,
+    )
+}
+
+fn sorted_cached_files(cached_map: HashMap<String, CachedFileSummary>) -> Vec<CachedFileSummary> {
+    let mut cached_files = cached_map.into_values().collect::<Vec<_>>();
+    cached_files.sort_by(|left, right| left.path.cmp(&right.path));
+    cached_files
 }
 
 fn collect_scannable_files(root: &Path) -> io::Result<Vec<PathBuf>> {
@@ -204,9 +396,10 @@ fn cached_summary_for_path(root: &Path, absolute_path: &Path) -> io::Result<Cach
     let relative = absolute_path
         .strip_prefix(root)
         .expect("scanned file should stay under root");
+    let bytes = fs::read(absolute_path)?;
     let path = normalize_path(relative);
-    let summary = summarize_file(absolute_path, relative);
-    let hash = compute_file_hash(absolute_path)?;
+    let summary = summarize_file(relative, &bytes);
+    let hash = compute_bytes_hash(&bytes);
 
     Ok(CachedFileSummary {
         path,
@@ -216,82 +409,136 @@ fn cached_summary_for_path(root: &Path, absolute_path: &Path) -> io::Result<Cach
 }
 
 fn load_index(root: &Path) -> io::Result<Option<PersistedIndex>> {
-    let Some(files_index) = load_files_index(root)? else {
+    let Some(manifest) = load_manifest(root)? else {
         return Ok(None);
     };
-    let Some(tags_index) = load_tags_index(root)? else {
-        return Ok(None);
-    };
-
-    if files_index.version != INDEX_VERSION || tags_index.version != INDEX_VERSION {
+    if manifest.version != INDEX_VERSION {
         return Ok(None);
     }
 
     let root_string = root.display().to_string();
-    if files_index.root != root_string || tags_index.root != root_string {
+    if manifest.root != root_string {
         return Ok(None);
     }
 
-    if files_index.files.len() != tags_index.file_tags.len() {
-        return Ok(None);
-    }
-
-    let mut files = Vec::with_capacity(files_index.files.len());
-    for (file, tags) in files_index.files.into_iter().zip(tags_index.file_tags) {
-        let Some(decoded_tags) = decode_tags(&tags, &tags_index.strings) else {
-            return Ok(None);
+    let mut files = Vec::with_capacity(manifest.files.len());
+    for entry in &manifest.files {
+        let path = shard_path(root, &entry.path);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!(
+                    "warn: failed to read shard at {}, falling back to full scan: {error}",
+                    path.display()
+                );
+                return Ok(None);
+            }
         };
-        files.push(CachedFileSummary {
-            path: file.path.clone(),
-            hash: file.hash,
-            summary: FileSummary {
-                file_id: file.path.clone(),
-                path: file.path,
-                language: file.language,
-                kind: file.kind,
-                location_summary: file.location_summary,
-                content_summary: file.content_summary,
-                tags: decoded_tags,
-            },
-        });
+        let shard = match decode_from_slice::<CachedFileSummary, _>(&bytes, standard()) {
+            Ok((shard, _)) => shard,
+            Err(error) => {
+                eprintln!(
+                    "warn: failed to decode shard at {}, falling back to full scan: {error}",
+                    path.display()
+                );
+                return Ok(None);
+            }
+        };
+        if shard.path != entry.path || shard.hash != entry.hash {
+            return Ok(None);
+        }
+        files.push(shard);
     }
 
     Ok(Some(PersistedIndex {
-        version: INDEX_VERSION,
-        root: root.display().to_string(),
+        version: manifest.version,
+        root: manifest.root,
+        git_head: manifest.git_head,
         files,
     }))
 }
 
-fn persist_index(root: &Path, files: &[CachedFileSummary]) -> io::Result<()> {
+fn persist_index(
+    root: &Path,
+    git_head: Option<&str>,
+    files: &[CachedFileSummary],
+) -> io::Result<()> {
     let index_dir = root.join(INDEX_DIR);
-    fs::create_dir_all(&index_dir)?;
+    let shards_dir = index_dir.join(SHARDS_DIR);
+    fs::create_dir_all(&shards_dir)?;
 
-    let files_payload = PersistedFilesIndex {
+    let previous_manifest = load_manifest(root).ok().flatten();
+    let previous_hashes = previous_manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .files
+                .iter()
+                .map(|entry| (entry.path.clone(), entry.hash.clone()))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let manifest = PersistedManifest {
         version: INDEX_VERSION,
         root: root.display().to_string(),
+        git_head: git_head.map(str::to_owned),
         files: files
             .iter()
-            .map(|file| PersistedFileSummary {
+            .map(|file| PersistedManifestEntry {
                 path: file.path.clone(),
                 hash: file.hash.clone(),
-                language: file.summary.language.clone(),
-                kind: file.summary.kind.clone(),
-                location_summary: file.summary.location_summary.clone(),
-                content_summary: file.summary.content_summary.clone(),
             })
             .collect(),
     };
-    let tags_payload = build_tags_index(root, files);
 
-    let files_bytes = encode_to_vec(&files_payload, standard())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let tags_bytes = encode_to_vec(&tags_payload, standard())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    fs::write(files_index_path(root), files_bytes)?;
-    fs::write(tags_index_path(root), tags_bytes)?;
+    for file in files {
+        let shard = shard_path(root, &file.path);
+        let should_write = previous_hashes
+            .get(&file.path)
+            .map(|hash| hash != &file.hash)
+            .unwrap_or(true)
+            || !shard.exists();
+        if !should_write {
+            continue;
+        }
 
-    for legacy_file in [LEGACY_COMBINED_INDEX_FILE, LEGACY_JSON_INDEX_FILE] {
+        if let Some(parent) = shard.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = encode_to_vec(file, standard())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fs::write(&shard, bytes)?;
+    }
+
+    if let Some(previous_manifest) = previous_manifest {
+        let next_paths = manifest
+            .files
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<HashSet<_>>();
+        for entry in previous_manifest.files {
+            if next_paths.contains(entry.path.as_str()) {
+                continue;
+            }
+            let shard = shard_path(root, &entry.path);
+            if shard.exists() {
+                fs::remove_file(&shard)?;
+                remove_empty_parent_dirs(&shard, &shards_dir)?;
+            }
+        }
+    }
+
+    let manifest_bytes = encode_to_vec(&manifest, standard())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(manifest_path(root), manifest_bytes)?;
+
+    for legacy_file in [
+        LEGACY_FILES_INDEX_FILE,
+        LEGACY_TAGS_INDEX_FILE,
+        LEGACY_COMBINED_INDEX_FILE,
+        LEGACY_JSON_INDEX_FILE,
+    ] {
         let legacy_path = root.join(INDEX_DIR).join(legacy_file);
         if legacy_path.exists() {
             fs::remove_file(legacy_path)?;
@@ -301,158 +548,261 @@ fn persist_index(root: &Path, files: &[CachedFileSummary]) -> io::Result<()> {
     Ok(())
 }
 
-fn load_files_index(root: &Path) -> io::Result<Option<PersistedFilesIndex>> {
-    let path = files_index_path(root);
-    if !path.exists() {
-        return Ok(None);
+fn persist_index_delta(
+    root: &Path,
+    git_head: Option<&str>,
+    previous_manifest: &PersistedManifest,
+    updated_files: HashMap<String, CachedFileSummary>,
+    removed_paths: HashSet<String>,
+) -> io::Result<()> {
+    let index_dir = root.join(INDEX_DIR);
+    let shards_dir = index_dir.join(SHARDS_DIR);
+    fs::create_dir_all(&shards_dir)?;
+
+    for file in updated_files.values() {
+        let shard = shard_path(root, &file.path);
+        if let Some(parent) = shard.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = encode_to_vec(file, standard())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fs::write(&shard, bytes)?;
     }
 
-    let bytes = fs::read(&path)?;
-    match decode_from_slice::<PersistedFilesIndex, _>(&bytes, standard()) {
-        Ok((index, _)) => Ok(Some(index)),
-        Err(error) => {
-            eprintln!(
-                "warn: failed to decode files index at {}, falling back to full scan: {error}",
-                path.display()
-            );
-            Ok(None)
+    for path in &removed_paths {
+        let shard = shard_path(root, path);
+        if shard.exists() {
+            fs::remove_file(&shard)?;
+            remove_empty_parent_dirs(&shard, &shards_dir)?;
         }
     }
-}
 
-fn load_tags_index(root: &Path) -> io::Result<Option<PersistedTagsIndex>> {
-    let path = tags_index_path(root);
-    if !path.exists() {
-        return Ok(None);
+    let mut next_entries = previous_manifest
+        .files
+        .iter()
+        .filter(|entry| !removed_paths.contains(&entry.path))
+        .map(|entry| (entry.path.clone(), entry.hash.clone()))
+        .collect::<HashMap<_, _>>();
+
+    for (path, file) in updated_files {
+        next_entries.insert(path, file.hash);
     }
 
-    let bytes = fs::read(&path)?;
-    match decode_from_slice::<PersistedTagsIndex, _>(&bytes, standard()) {
-        Ok((index, _)) => Ok(Some(index)),
-        Err(error) => {
-            eprintln!(
-                "warn: failed to decode tags index at {}, falling back to full scan: {error}",
-                path.display()
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn build_tags_index(root: &Path, files: &[CachedFileSummary]) -> PersistedTagsIndex {
-    let mut strings = StringTableBuilder::default();
-    let mut file_tags = Vec::with_capacity(files.len());
-    let mut postings = HashMap::<u32, Vec<u32>>::new();
-
-    for (file_index, file) in files.iter().enumerate() {
-        let mut compact_tags = Vec::with_capacity(file.summary.tags.len());
-        for tag in &file.summary.tags {
-            let value_id = strings.intern(&tag.value);
-            let source_id = strings.intern(&tag.source);
-            let evidence_ids = tag
-                .evidence
-                .iter()
-                .map(|evidence| strings.intern(evidence))
-                .collect::<Vec<_>>();
-
-            compact_tags.push(CompactTag {
-                value_id,
-                source_id,
-                confidence: tag.confidence,
-                evidence_ids,
-            });
-            postings
-                .entry(value_id)
-                .or_default()
-                .push(file_index as u32);
-        }
-        file_tags.push(compact_tags);
-    }
-
-    let mut inverted_index = postings
+    let mut files = next_entries
         .into_iter()
-        .map(|(value_id, file_indices)| CompactPosting {
-            value_id,
-            file_indices,
-        })
+        .map(|(path, hash)| PersistedManifestEntry { path, hash })
         .collect::<Vec<_>>();
-    inverted_index.sort_by_key(|posting| posting.value_id);
+    files.sort_by(|left, right| left.path.cmp(&right.path));
 
-    PersistedTagsIndex {
+    let manifest = PersistedManifest {
         version: INDEX_VERSION,
         root: root.display().to_string(),
-        strings: strings.strings,
-        file_tags,
-        inverted_index,
+        git_head: git_head.map(str::to_owned),
+        files,
+    };
+    let manifest_bytes = encode_to_vec(&manifest, standard())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::write(manifest_path(root), manifest_bytes)?;
+
+    for legacy_file in [
+        LEGACY_FILES_INDEX_FILE,
+        LEGACY_TAGS_INDEX_FILE,
+        LEGACY_COMBINED_INDEX_FILE,
+        LEGACY_JSON_INDEX_FILE,
+    ] {
+        let legacy_path = root.join(INDEX_DIR).join(legacy_file);
+        if legacy_path.exists() {
+            fs::remove_file(legacy_path)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn load_manifest(root: &Path) -> io::Result<Option<PersistedManifest>> {
+    let path = manifest_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&path)?;
+    match decode_from_slice::<PersistedManifest, _>(&bytes, standard()) {
+        Ok((manifest, _)) => Ok(Some(manifest)),
+        Err(error) => {
+            eprintln!(
+                "warn: failed to decode manifest at {}, falling back to full scan: {error}",
+                path.display()
+            );
+            Ok(None)
+        }
     }
 }
 
-fn decode_tags(tags: &[CompactTag], strings: &[String]) -> Option<Vec<Tag>> {
-    tags.iter()
-        .map(|tag| {
-            Some(Tag {
-                value: strings.get(tag.value_id as usize)?.clone(),
-                source: strings.get(tag.source_id as usize)?.clone(),
-                confidence: tag.confidence,
-                evidence: tag
-                    .evidence_ids
-                    .iter()
-                    .map(|id| strings.get(*id as usize).cloned())
-                    .collect::<Option<Vec<_>>>()?,
-            })
-        })
-        .collect()
+fn manifest_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(MANIFEST_FILE)
 }
 
-fn files_index_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join(FILES_INDEX_FILE)
+fn shard_path(root: &Path, relative_path: &str) -> PathBuf {
+    let mut shard = root.join(INDEX_DIR).join(SHARDS_DIR).join(relative_path);
+    let file_name = shard
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("relative path should end with a file name");
+    shard.set_file_name(format!("{file_name}.bin"));
+    shard
 }
 
-fn tags_index_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join(TAGS_INDEX_FILE)
+fn remove_empty_parent_dirs(path: &Path, stop_at: &Path) -> io::Result<()> {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if dir == stop_at {
+            break;
+        }
+        if fs::read_dir(dir)?.next().is_some() {
+            break;
+        }
+        fs::remove_dir(dir)?;
+        current = dir.parent();
+    }
+    Ok(())
 }
 
-impl StringTableBuilder {
-    fn intern(&mut self, value: &str) -> u32 {
-        match self.ids.entry(value.to_owned()) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let id = self.strings.len() as u32;
-                self.strings.push(entry.key().clone());
-                entry.insert(id);
-                id
+pub(crate) fn load_index_paths(root: &Path) -> io::Result<Option<Vec<String>>> {
+    Ok(load_manifest(root)?.map(|manifest| {
+        manifest
+            .files
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<Vec<_>>()
+    }))
+}
+
+pub(crate) fn load_cached_summary(
+    root: &Path,
+    relative_path: &str,
+) -> io::Result<Option<FileSummary>> {
+    let path = shard_path(root, relative_path);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&path)?;
+    match decode_from_slice::<CachedFileSummary, _>(&bytes, standard()) {
+        Ok((cached, _)) => Ok(Some(cached.summary)),
+        Err(error) => {
+            eprintln!(
+                "warn: failed to decode shard at {}, falling back to full scan: {error}",
+                path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn collect_changed_cached_files(
+    root: &Path,
+    changed_paths: HashSet<String>,
+) -> io::Result<(HashMap<String, CachedFileSummary>, HashSet<String>)> {
+    let mut updated_files = HashMap::new();
+    let mut removed_paths = HashSet::new();
+    let mut ordered_changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
+    ordered_changed_paths.sort();
+
+    for path in ordered_changed_paths {
+        let absolute_path = root.join(&path);
+        if absolute_path.is_file() {
+            updated_files.insert(path, cached_summary_for_path(root, &absolute_path)?);
+        } else {
+            removed_paths.insert(path);
+        }
+    }
+
+    Ok((updated_files, removed_paths))
+}
+
+fn collect_git_changed_paths(
+    root: &Path,
+    previous_head: Option<&str>,
+    current_head: Option<&str>,
+) -> io::Result<HashSet<String>> {
+    let mut changed = HashSet::new();
+
+    if previous_head != current_head {
+        match (previous_head, current_head) {
+            (Some(previous_head), Some(current_head)) => {
+                extend_changed_paths(
+                    root,
+                    &mut changed,
+                    &[
+                        "diff",
+                        "--name-only",
+                        "--relative",
+                        previous_head,
+                        current_head,
+                    ],
+                )?;
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "git HEAD changed without a stable baseline",
+                ));
             }
         }
     }
-}
 
-fn collect_git_changed_paths(root: &Path) -> io::Result<HashSet<String>> {
-    let mut changed = HashSet::new();
     for args in [
         &["diff", "--name-only", "--relative"][..],
         &["diff", "--name-only", "--relative", "--cached"][..],
         &["ls-files", "--others", "--exclude-standard"][..],
     ] {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()?;
-        if !output.status.success() {
-            return Err(io::Error::other(String::from_utf8_lossy(&output.stderr)));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            changed.insert(normalize_path(Path::new(line)));
-        }
+        extend_changed_paths(root, &mut changed, args)?;
     }
 
     Ok(changed)
+}
+
+fn extend_changed_paths(
+    root: &Path,
+    changed: &mut HashSet<String>,
+    args: &[&str],
+) -> io::Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(String::from_utf8_lossy(&output.stderr)));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        changed.insert(normalize_path(Path::new(line)));
+    }
+
+    Ok(())
+}
+
+fn current_git_head(root: &Path) -> io::Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()?;
+    if output.status.success() {
+        let head = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if head.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(head))
+        }
+    } else {
+        Err(io::Error::other(String::from_utf8_lossy(&output.stderr)))
+    }
 }
 
 fn contains_gitignore_change(changed_paths: &HashSet<String>) -> bool {
@@ -478,9 +828,39 @@ fn collect_changed_paths_by_hash(
     Ok(changed)
 }
 
+fn collect_changed_paths_by_manifest_hash(
+    current_map: &HashMap<String, PathBuf>,
+    previous_hashes: &HashMap<&str, &str>,
+) -> io::Result<HashSet<String>> {
+    let mut changed = HashSet::new();
+
+    for (path, absolute_path) in current_map {
+        let bytes = fs::read(absolute_path)?;
+        let hash = compute_bytes_hash(&bytes);
+        match previous_hashes.get(path.as_str()) {
+            Some(previous_hash) if hash == *previous_hash => {}
+            _ => {
+                changed.insert(path.clone());
+            }
+        }
+    }
+
+    for path in previous_hashes.keys() {
+        if !current_map.contains_key(*path) {
+            changed.insert((*path).to_owned());
+        }
+    }
+
+    Ok(changed)
+}
+
 fn compute_file_hash(path: &Path) -> io::Result<String> {
     let bytes = fs::read(path)?;
-    Ok(fnv1a_hash(&bytes))
+    Ok(compute_bytes_hash(&bytes))
+}
+
+fn compute_bytes_hash(bytes: &[u8]) -> String {
+    fnv1a_hash(bytes)
 }
 
 fn fnv1a_hash(bytes: &[u8]) -> String {
@@ -492,12 +872,11 @@ fn fnv1a_hash(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-fn summarize_file(absolute_path: &Path, relative_path: &Path) -> FileSummary {
+fn summarize_file(relative_path: &Path, bytes: &[u8]) -> FileSummary {
     let location_summary = summarize_location(relative_path);
     let language = detect_language(&location_summary.extension).map(str::to_owned);
     let kind = detect_kind(relative_path, &location_summary).to_owned();
-    let content_summary =
-        analyze_file_content(absolute_path, location_summary.extension.as_deref());
+    let content_summary = analyze_file_content(bytes, location_summary.extension.as_deref());
     let tags = generate_tags(
         relative_path,
         &location_summary,
@@ -756,9 +1135,9 @@ fn generate_tags(
     tags
 }
 
-fn analyze_file_content(absolute_path: &Path, extension: Option<&str>) -> Option<ContentSummary> {
-    let content = fs::read_to_string(absolute_path).ok()?;
-    Some(analyze_content(&content, extension))
+fn analyze_file_content(bytes: &[u8], extension: Option<&str>) -> Option<ContentSummary> {
+    let content = std::str::from_utf8(bytes).ok()?;
+    Some(analyze_content(content, extension))
 }
 
 fn analyze_content(content: &str, extension: Option<&str>) -> ContentSummary {
@@ -1564,12 +1943,12 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ScanMode, analyze_content, contains_gitignore_change, detect_kind, files_index_path,
-        generate_tags, load_tags_index, scan_project_with_mode, summarize_location,
-        tags_index_path,
+        ScanMode, analyze_content, contains_gitignore_change, detect_kind, generate_tags,
+        load_manifest, manifest_path, scan_project_with_mode, shard_path, summarize_location,
     };
 
     fn temp_path(name: &str) -> PathBuf {
@@ -1578,6 +1957,36 @@ mod tests {
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("proj-finder-scanner-{name}-{nanos}"))
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn commit_all(root: &Path, message: &str) {
+        run_git(root, &["add", "."]);
+        run_git(
+            root,
+            &[
+                "-c",
+                "user.name=proj-finder-test",
+                "-c",
+                "user.email=proj-finder@example.com",
+                "commit",
+                "-m",
+                message,
+            ],
+        );
     }
 
     #[test]
@@ -1790,8 +2199,8 @@ fn parse_fixture() -> &'static str {
 
         let first = scan_project_with_mode(&root, ScanMode::Incremental)
             .expect("first incremental scan should succeed");
-        assert!(files_index_path(&root).exists());
-        assert!(tags_index_path(&root).exists());
+        assert!(manifest_path(&root).exists());
+        assert!(shard_path(&root, "src/main.rs").exists());
         assert!(
             !first
                 .files
@@ -1824,8 +2233,47 @@ fn parse_fixture() -> &'static str {
     }
 
     #[test]
-    fn persisted_tags_index_deduplicates_values_and_builds_postings() {
-        let root = temp_path("tag-index");
+    fn incremental_scan_detects_committed_changes_without_full_walk() {
+        let root = temp_path("incremental-committed-update");
+        fs::create_dir_all(&root).expect("should create repo root");
+        fs::create_dir_all(root.join("src")).expect("should create src dir");
+        run_git(&root, &["init"]);
+        fs::write(root.join(".gitignore"), ".proj-finder/\n").expect("should write gitignore");
+        fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("should write source file");
+        commit_all(&root, "initial");
+
+        scan_project_with_mode(&root, ScanMode::Incremental)
+            .expect("initial incremental scan should succeed");
+
+        fs::write(
+            root.join("src").join("main.rs"),
+            "use reqwest::Client;\nfn main() {}\n",
+        )
+        .expect("should update source file");
+        commit_all(&root, "update main");
+
+        let second = scan_project_with_mode(&root, ScanMode::Incremental)
+            .expect("incremental scan after commit should succeed");
+        let main_file = second
+            .files
+            .iter()
+            .find(|file| file.path == "src/main.rs")
+            .expect("main file should exist");
+        let imports = &main_file
+            .content_summary
+            .as_ref()
+            .expect("main file should have content summary")
+            .imports;
+
+        assert!(imports.contains(&"reqwest::client".to_owned()));
+
+        fs::remove_dir_all(root).expect("should clean up temp dir");
+    }
+
+    #[test]
+    fn persisted_manifest_tracks_files_and_shards() {
+        let root = temp_path("manifest-shards");
         fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
         fs::create_dir_all(root.join("src")).expect("should create src dir");
         fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
@@ -1835,30 +2283,25 @@ fn parse_fixture() -> &'static str {
 
         scan_project_with_mode(&root, ScanMode::Incremental)
             .expect("incremental scan should succeed");
-        let tags_index = load_tags_index(&root)
-            .expect("tag index should load")
-            .expect("tag index should exist");
+        let manifest = load_manifest(&root)
+            .expect("manifest should load")
+            .expect("manifest should exist");
 
-        assert_eq!(
-            tags_index
-                .strings
+        assert_eq!(manifest.files.len(), 2);
+        assert!(
+            manifest
+                .files
                 .iter()
-                .filter(|value| value.as_str() == "lang:rust")
-                .count(),
-            1
+                .any(|entry| entry.path == "src/main.rs")
         );
-
-        let lang_rust_id = tags_index
-            .strings
-            .iter()
-            .position(|value| value == "lang:rust")
-            .expect("lang:rust should be interned") as u32;
-        let posting = tags_index
-            .inverted_index
-            .iter()
-            .find(|posting| posting.value_id == lang_rust_id)
-            .expect("lang:rust should have a posting list");
-        assert_eq!(posting.file_indices.len(), 2);
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|entry| entry.path == "src/lib.rs")
+        );
+        assert!(shard_path(&root, "src/main.rs").exists());
+        assert!(shard_path(&root, "src/lib.rs").exists());
 
         fs::remove_dir_all(root).expect("should clean up temp dir");
     }
@@ -1882,6 +2325,7 @@ fn parse_fixture() -> &'static str {
 
         assert!(second.files.iter().any(|file| file.path == "src/main.rs"));
         assert!(!second.files.iter().any(|file| file.path == "src/lib.rs"));
+        assert!(!shard_path(&root, "src/lib.rs").exists());
 
         fs::remove_dir_all(root).expect("should clean up temp dir");
     }
@@ -1892,8 +2336,11 @@ fn parse_fixture() -> &'static str {
         fs::create_dir_all(root.join(".git")).expect("should create fake git dir");
         fs::create_dir_all(root.join("src")).expect("should create src dir");
         fs::create_dir_all(root.join(".proj-finder")).expect("should create index dir");
-        fs::write(root.join(".proj-finder").join("files.bin"), "not-bincode")
-            .expect("should write invalid index");
+        fs::write(
+            root.join(".proj-finder").join("manifest.bin"),
+            "not-bincode",
+        )
+        .expect("should write invalid index");
         fs::write(root.join("src").join("main.rs"), "fn main() {}\n")
             .expect("should write source file");
 

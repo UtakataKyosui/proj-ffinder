@@ -281,6 +281,7 @@ dependencies = [
  "bincode",
  "clap",
  "ignore",
+ "regex",
  "serde",
  "serde_json",
  "syn",
