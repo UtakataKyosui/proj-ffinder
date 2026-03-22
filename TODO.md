@@ -16,11 +16,11 @@ Agentic Coding Tool から見た使い勝手と
 - [x] 内容要約 (`content_summary`) を生成する
 - [x] タグ (`tags`) を生成する
 - [x] タグに `source` / `confidence` / `evidence` を持たせる
-- [ ] Git 差分 (`git diff`, `git ls-files`) を使って変更候補を高速に絞る
-- [ ] 差分更新で再解析対象だけを更新する
-- [ ] Git 差分が使えない場合の hash fallback を実装する
-- [ ] インデックスの永続化形式を導入する
-- [ ] フルスキャンと差分更新を切り替える仕組みを持つ
+- [x] Git 差分 (`git diff`, `git ls-files`) を使って変更候補を高速に絞る
+- [x] 差分更新で再解析対象だけを更新する
+- [x] Git 差分が使えない場合の hash fallback を実装する
+- [x] インデックスの永続化形式を導入する
+- [x] フルスキャンと差分更新を切り替える仕組みを持つ
 
 ## 検索機能
 
@@ -41,8 +41,8 @@ Agentic Coding Tool から見た使い勝手と
 - [x] 旧来の `cargo run -- .` を互換動作として残す
 - [ ] 出力形式の切り替えオプションを追加する
 - [ ] Agent プロファイル切り替え (`--profile ...`) を追加する
-- [ ] 差分更新用サブコマンドまたはフラグを追加する
-- [ ] Git 差分ベース更新とフルスキャンを選べるようにする
+- [x] 差分更新用サブコマンドまたはフラグを追加する
+- [x] Git 差分ベース更新とフルスキャンを選べるようにする
 
 ## Agent 最適化
 
@@ -77,8 +77,8 @@ Agentic Coding Tool から見た使い勝手と
 - [x] README に CLI の使い方を記載する
 - [x] README に CI / Release の流れを記載する
 - [ ] README に Agent プロファイル設計を追記する
-- [ ] README に差分更新の仕様を追記する
-- [ ] README に Git 差分 fast path と hash fallback の役割分担を追記する
+- [x] README に差分更新の仕様を追記する
+- [x] README に Git 差分 fast path と hash fallback の役割分担を追記する
 
 ## 運用メモ
 

@@ -6,7 +6,7 @@ pub struct ScanResult {
     pub files: Vec<FileSummary>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FileSummary {
     pub file_id: String,
     pub path: String,
@@ -17,7 +17,7 @@ pub struct FileSummary {
     pub tags: Vec<Tag>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LocationSummary {
     pub depth: usize,
     pub dirs: Vec<String>,
@@ -28,7 +28,7 @@ pub struct LocationSummary {
     pub path_patterns: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Tag {
     pub value: String,
     pub source: String,
@@ -36,7 +36,7 @@ pub struct Tag {
     pub evidence: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ContentSummary {
     pub imports: Vec<String>,
     pub exports: Vec<String>,
@@ -48,7 +48,7 @@ pub struct ContentSummary {
     pub metrics: ContentMetrics,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ContentMetrics {
     pub byte_count: usize,
     pub line_count: usize,

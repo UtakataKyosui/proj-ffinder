@@ -495,6 +495,38 @@ Agent がタグ検索を使うなら、
 毎回フルリビルドすると重くなるため、
 差分更新を前提にした方がよい。
 
+現在の実装では、次の二段構えを採る。
+
+1. `git diff` / `git ls-files` を使う fast path
+2. Git 差分が使えない場合の hash fallback
+
+### fast path
+
+Git リポジトリとして扱える場合は、
+まず以下を使って変更候補を絞る。
+
+- `git diff --name-only --relative`
+- `git diff --name-only --relative --cached`
+- `git ls-files --others --exclude-standard`
+
+これにより、
+
+- tracked な変更
+- staged な変更
+- untracked な新規ファイル
+
+を先に拾う。
+
+### hash fallback
+
+以下のケースでは、
+ファイル列挙 + 内容 hash 比較へ落とす。
+
+- Git コマンドが使えない
+- Git 差分の取得に失敗する
+- `.gitignore` が変更されている
+- インデックスキャッシュが存在しない、または壊れている
+
 基本方針:
 
 - 新規ファイルは追加解析
@@ -533,10 +565,13 @@ Agent がタグ検索を使うなら、
 4. 軽量内容要約器
 5. 位置情報と内容要約の両方を使うタグ生成器
 6. Rust / TypeScript / Python / Go に対する部分 AST 解析
+7. Git 差分 fast path + hash fallback による差分更新
+8. ローカル index 保存
 
 まだ行っていないもの:
 
-- 差分更新
+- Agent ごとの profile 切り替え
+- 人間向けの検索整形出力
 
 現在はこれに加えて、
 **タグに対する構造化検索器** を持つ。
@@ -586,6 +621,18 @@ AST ベースで拾うため、
 - `content_summary`
 - `tags`
 
+差分更新を使う場合は、
+リポジトリルート配下の
+`.proj-finder/files.bin`
+と
+`.proj-finder/tags.bin`
+へ要約キャッシュを保存する。
+
+`files.bin` にはファイル要約本体を、
+`tags.bin` にはタグ辞書と inverted index を持たせる。
+CLI 出力用 JSON とは分離し、
+内部保存は軽量バイナリ形式で扱う。
+
 ### 使い方
 
 ```bash
@@ -606,6 +653,13 @@ CLI は `clap` ベースで、
 走査対象外のファイルやディレクトリは、
 基本的にそのリポジトリの `.gitignore` に従う。
 
+差分更新を使う場合は、
+次のように `--incremental` を付ける。
+
+```bash
+cargo run -- scan . --incremental
+```
+
 旧来の `cargo run -- .` も、互換のため `scan` として扱う。
 
 ### 検索の使い方
@@ -614,6 +668,13 @@ CLI は `clap` ベースで、
 
 ```bash
 cargo run -- search . --query '{"must":["role:docs"],"prefer":["ext:md"],"limit":5}'
+```
+
+差分更新済み index を使いながら検索したい場合は、
+次のように `--incremental` を付ける。
+
+```bash
+cargo run -- search . --incremental --query '{"must":["role:docs"],"prefer":["ext:md"],"limit":5}'
 ```
 
 クエリの形式:
